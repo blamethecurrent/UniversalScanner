@@ -389,10 +389,30 @@ local function placeInfo(placeId)
     return name, canJoin
 end
 
+local function extractServerPopulation(...)
+    local seen = {}
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == "table" and not seen[v] then
+            seen[v] = true
+            local count = tonumber(v.PlayerCount) or tonumber(v.CurrentPlayers) or tonumber(v.Count)
+            local max = tonumber(v.MaxPlayers) or tonumber(v.Max) or tonumber(v.Capacity)
+            if count and max then return count, max end
+            if count and v.MaxPlayers then return count, tonumber(v.MaxPlayers) end
+            if v.ServerInfo and type(v.ServerInfo) == "table" then
+                local c2 = tonumber(v.ServerInfo.PlayerCount) or tonumber(v.ServerInfo.CurrentPlayers) or tonumber(v.ServerInfo.Count)
+                local m2 = tonumber(v.ServerInfo.MaxPlayers) or tonumber(v.ServerInfo.Max) or tonumber(v.ServerInfo.Capacity)
+                if c2 and m2 then return c2, m2 end
+            end
+        end
+    end
+    return nil, nil
+end
+
 local function scanPlayer(name)
     local fn = getReFunction()
     if not fn then return { status = "error", reason = "remote missing" } end
-    local ok, a, _, c, d, e, f =
+    local ok, a, b, c, d, e, f, g, h, i, j, k =
         pcall(fn.InvokeServer, fn, "GetPlayerPlaceInstanceAsync", name)
     if not ok then return { status = "error", reason = tostring(a) } end
     if a == nil and c == nil and f == nil then
@@ -403,6 +423,7 @@ local function scanPlayer(name)
     local userId      = tonumber(e)
     local jobId       = (d and tostring(d)) or ""
     local exactMatch  = displayName ~= "" and displayName:lower() == name:lower()
+    local playerCount, maxPlayers = extractServerPopulation(a, b, c, d, e, f, g, h, i, j, k)
 
     if placeId and placeId > 0 then
         local pName, canJoin = placeInfo(placeId)
@@ -410,11 +431,13 @@ local function scanPlayer(name)
             status = "online", placeId = placeId, jobId = jobId,
             userId = userId, displayName = displayName, exactMatch = exactMatch,
             placeName = pName, canJoin = canJoin, at = os.time(),
+            playerCount = playerCount, maxPlayers = maxPlayers,
         }
     elseif displayName ~= "" then
         return {
             status = "offline", displayName = displayName,
             exactMatch = exactMatch, at = os.time(),
+            playerCount = playerCount, maxPlayers = maxPlayers,
         }
     else
         return { status = "notfound", at = os.time() }
@@ -465,12 +488,29 @@ local function fetchServerPage()
     serverPage = (serverPage % math.max(1, serverPageMax)) + 1
 end
 
-local function scoreTag(jobId)
-    if not cfg.showScores or not jobId or jobId == "" then return "" end
+local function scoreTag(jobId, fallbackCount, fallbackMax)
+    if not cfg.showScores and not (fallbackCount and fallbackMax and tonumber(fallbackMax) > 0) then
+        return ""
+    end
+
     local s = serverCache[jobId]
-    if not s or (os.time() - s.at) > CLAMP.scoreTTL then return "" end
-    return (" · Q%d %d:%02d · %d-%d · %d/%d")
-        :format(s.quarter, s.minutes, s.seconds, s.home, s.away, s.count, s.max)
+    if s and (os.time() - s.at) <= CLAMP.scoreTTL then
+        local count = tonumber(s.count) or tonumber(fallbackCount) or 0
+        local max = tonumber(s.max) or tonumber(fallbackMax) or 0
+        if max > 0 or count > 0 then
+            return (" · %d/%d"):format(count, max)
+        end
+        return ""
+    end
+
+    if fallbackCount and fallbackMax and tonumber(fallbackMax) > 0 then
+        return (" · %d/%d"):format(tonumber(fallbackCount), tonumber(fallbackMax))
+    end
+
+    if config and not cfg.showScores then
+        return ""
+    end
+    return ""
 end
 
 -- ============================================================
@@ -863,7 +903,7 @@ local function formatLabel(name, r)
         if r.jobId and #r.jobId >= 6 then
             jobTag = "  ·  " .. string.upper(string.sub(r.jobId, 1, 6))
         end
-        local score = scoreTag(r.jobId)
+        local score = scoreTag(r.jobId, r.playerCount, r.maxPlayers)
         local placeTag = ""
         if r.placeName and r.placeName ~= "" then
             placeTag = "  ·  " .. r.placeName
@@ -1394,6 +1434,8 @@ local function notifyChange(name, result, prevStatus)
         if s and (os.time() - s.at) <= CLAMP.scoreTTL then
             scoreStr = ("Q%d %d:%02d · %d-%d")
                 :format(s.quarter, s.minutes, s.seconds, s.home, s.away)
+        elseif result.playerCount and result.maxPlayers and tonumber(result.maxPlayers) > 0 then
+            scoreStr = ("%d/%d"):format(tonumber(result.playerCount), tonumber(result.maxPlayers))
         end
     end
     if notifySwitch and notifySwitch.on then
