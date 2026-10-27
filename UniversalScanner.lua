@@ -1,5 +1,8 @@
 --[[
-    UniversalScanner — rbimgui-2 UI (v10)
+    UniversalScanner — rbimgui-2 UI (v12)
+    v10: original
+    v11: age display, drag-reorder, labeled Scan button, autostart wiring
+    v12: sequential skip-fresh scan loop; separate offline/online recheck intervals
 ]]
 
 -- ============================================================
@@ -20,7 +23,7 @@ local LOG_PATH    = FOLDER .. "/log.txt"
 
 local UNIVERSE_ID = 184199275
 
--- honeypot !!!!! 
+-- honeypot !!!!!
 local BLOCKED_PLACES = {
     [12770493773] = "UF: Admin (honeypot)",
 }
@@ -51,15 +54,17 @@ local SEED_PLACES = {
 }
 
 local HARD_DEFAULTS = {
-    version = 2, interval = 5, passDelay = 0,
+    version = 3, interval = 5, passDelay = 1,
     notify = true, autoStart = true,
     audioEnabled = false, audioId = "",
     webhookEnabled = false, webhookUrl = "",
     showScores = true,
+    adaptiveRecheck = true, onlineRecheck = 60,
     windowW = 470, windowH = 520,
 }
 local CLAMP = {
     interval  = { 3, 30 }, passDelay = { 0, 300 },
+    onlineRecheck = { 15, 600 },
     windowW   = { 380, 800 }, windowH = { 240, 720 },
     retries   = 2, timeout = 30, maxBackoff = 60,
     scoreRefresh = 10, scoreTTL = 120,
@@ -271,11 +276,13 @@ local function cleanAudioId(s)
 end
 local function sanitizeConfig(c)
     return {
-        version        = 2,
+        version        = 3,
         interval       = clampInt(c.interval,  CLAMP.interval[1],  CLAMP.interval[2],  HARD_DEFAULTS.interval),
         passDelay      = clampInt(c.passDelay, CLAMP.passDelay[1], CLAMP.passDelay[2], HARD_DEFAULTS.passDelay),
+        onlineRecheck  = clampInt(c.onlineRecheck, CLAMP.onlineRecheck[1], CLAMP.onlineRecheck[2], HARD_DEFAULTS.onlineRecheck),
         notify         = c.notify    == true,
         autoStart      = c.autoStart == true,
+        adaptiveRecheck = c.adaptiveRecheck ~= false,
         audioEnabled   = c.audioEnabled == true,
         audioId        = cleanAudioId(c.audioId),
         webhookEnabled = c.webhookEnabled == true,
@@ -326,12 +333,12 @@ local function loadState()
     if raw then
         local ok, d = pcall(function() return HttpService:JSONDecode(raw) end)
         if ok and type(d) == "table" then
-            d.nextIndex = tonumber(d.nextIndex) or 1
+            d.nextIndex = nil        -- v3: no longer index-driven
             d.results   = d.results or {}
             return d
         end
     end
-    return { version = 2, nextIndex = 1, results = {} }
+    return { version = 3, results = {} }
 end
 local function saveState(s)
     local ok, e = pcall(function() return HttpService:JSONEncode(s) end)
@@ -343,8 +350,6 @@ local function pruneState(s, list)
     for k in pairs(s.results) do
         if not keep[k] then s.results[k] = nil end
     end
-    if s.nextIndex < 1 then s.nextIndex = 1 end
-    if s.nextIndex > #list then s.nextIndex = math.max(1, #list) end
 end
 
 if hasFS and not fileExists(NAMES_PATH) then
@@ -536,17 +541,18 @@ local mainFrame    = findMainFrame(WIN_TITLE)
 local contentFrame = mainFrame and mainFrame:FindFirstChild("Content")
 
 -- ============================================================
--- Runtime flags + forward-declared switch refs
+-- Runtime flags + forward-declared refs
 -- ============================================================
 local running     = false
 local scanGen     = 0
 local currentMode = "Idle"
-local passesDone  = 0
 local killed      = false
 
--- These are wired in the Settings tab, but referenced by notifyChange/playAlert/webhookStatus
 local notifySwitch, audioSwitch, webhookSwitch, scoreSwitch, autoSwitch
+local adaptiveSwitch, onlineSlider
 local audioBox, webhookBox
+local intervalSlider, passSlider
+local getInterval, getPassDelay, getOnlineRecheck
 
 -- ============================================================
 -- Toast
@@ -630,6 +636,13 @@ local function webhookStatus(name, result, prevStatus, scoreStr)
         end
         if scoreStr and scoreStr ~= "" then
             table.insert(fields, { name = "Server score", value = scoreStr, inline = true })
+        end
+        if result.at then
+            table.insert(fields, {
+                name = "Captured",
+                value = ("<t:%d:R>"):format(result.at),
+                inline = true,
+            })
         end
         if result.placeId and result.jobId and result.jobId ~= "" then
             table.insert(fields, {
@@ -787,6 +800,19 @@ local resetBtn = makeCtrlBtn("Reset", 172, 80, COL.btnMuted)
 -- ============================================================
 local playerRows = {}
 
+-- drag-reorder state
+local dragState = { fromName = nil, toName = nil }
+local function rowIndexOf(nm)
+    for i, n in ipairs(names) do if n == nm then return i end end
+end
+local function clearDragHighlight()
+    for _, r in pairs(playerRows) do
+        if r.row and r.row.Parent then r.row.BackgroundTransparency = 1 end
+    end
+end
+
+local refreshOne   -- forward declaration; assigned after notifyChange
+
 local function joinServer(placeId, jobId, canJoin)
     if killed then return end
     if not placeId or not jobId or jobId == "" then
@@ -815,6 +841,20 @@ local function joinServer(placeId, jobId, canJoin)
     if not ok then toast("Scanner", "Teleport failed") end
 end
 
+local function relAge(at)
+    if not at then return "" end
+    local d = os.time() - at
+    if d < 0 then d = 0 end
+    if d < 60 then return ("%ds ago"):format(d)
+    elseif d < 3600 then return ("%dm ago"):format(math.floor(d / 60))
+    elseif d < 86400 then return ("%dh ago"):format(math.floor(d / 3600))
+    else return ("%dd ago"):format(math.floor(d / 86400)) end
+end
+local function ageTag(r)
+    if not r or not r.at then return "" end
+    return "  ·  " .. relAge(r.at)
+end
+
 local function formatLabel(name, r)
     local s = r and r.status or "unknown"
     local char = statusChar(s)
@@ -830,20 +870,26 @@ local function formatLabel(name, r)
         elseif r.placeId then
             placeTag = "  ·  Place " .. tostring(r.placeId)
         end
+        local base
         if r.exactMatch == false and r.displayName then
-            return ("%s %s → %s%s%s%s"):format(
+            base = ("%s %s → %s%s%s%s"):format(
                 char, name, r.displayName, jobTag, score, placeTag)
+        else
+            base = ("%s %s%s%s%s"):format(char, name, jobTag, score, placeTag)
         end
-        return ("%s %s%s%s%s"):format(char, name, jobTag, score, placeTag)
+        return base .. ageTag(r)
     elseif s == "offline" then
+        local base
         if r.exactMatch == false and r.displayName then
-            return ("%s %s → %s"):format(char, name, r.displayName)
+            base = ("%s %s → %s"):format(char, name, r.displayName)
+        else
+            base = char .. " " .. (r.displayName or name)
         end
-        return char .. " " .. (r.displayName or name)
+        return base .. ageTag(r)
     elseif s == "notfound" then
-        return char .. " " .. name .. "  (not found)"
+        return char .. " " .. name .. "  (not found)" .. ageTag(r)
     else
-        return char .. " " .. name .. "  " .. (r and r.reason or "?")
+        return char .. " " .. name .. "  " .. (r and r.reason or "?") .. ageTag(r)
     end
 end
 
@@ -856,14 +902,69 @@ local function updateTabCanvas()
     end)
 end
 
+-- ============================================================
+-- Recheck helpers
+--   Offline / unknown / notfound -> every Offline recheck
+--   Online                       -> every Online recheck (if adaptive on)
+-- ============================================================
+local function thresholdFor(r)
+    local t = cfg.interval
+    if getInterval then t = getInterval() end
+    if r and r.status == "online" then
+        local adaptive = cfg.adaptiveRecheck
+        if adaptiveSwitch then adaptive = adaptiveSwitch.on end
+        if adaptive then
+            local online = cfg.onlineRecheck
+            if getOnlineRecheck then online = getOnlineRecheck() end
+            if online > t then t = online end
+        end
+    end
+    return t
+end
+
+local function isStale(name)
+    local r = state.results[name]
+    if not r or not r.at then return true end
+    return (os.time() - r.at) >= thresholdFor(r)
+end
+
+local function timeUntilNextStale()
+    local now = os.time()
+    local soonest = math.huge
+    for _, n in ipairs(names) do
+        local r = state.results[n]
+        if not r or not r.at then return 0 end
+        local untilStale = (r.at + thresholdFor(r)) - now
+        if untilStale < soonest then soonest = untilStale end
+    end
+    return soonest
+end
+
 local function buildRow(name)
     local row = Instance.new("Frame")
     row.Name = "Row_" .. name; row.LayoutOrder = 100
     row.Size = UDim2.new(1, 0, 0, 20)
     row.BackgroundTransparency = 1; row.Parent = tabItems
 
+    -- drag grip
+    local grip = Instance.new("TextButton")
+    grip.Name = "Grip"
+    grip.Size = UDim2.new(0, 14, 1, 0)
+    grip.BackgroundTransparency = 1
+    grip.Font = Enum.Font.Code
+    grip.Text = "⋮"; grip.TextSize = 14
+    grip.TextColor3 = COL.unknown
+    grip.Parent = row
+    grip.MouseButton1Down:Connect(function()
+        if killed then return end
+        dragState.fromName = name
+        dragState.toName = nil
+    end)
+
     local lbl = Instance.new("TextLabel")
-    lbl.Name = "Lbl"; lbl.Size = UDim2.new(1, -32, 1, 0)
+    lbl.Name = "Lbl"
+    lbl.Size = UDim2.new(1, -80, 1, 0)
+    lbl.Position = UDim2.new(0, 14, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Font = Enum.Font.Code; lbl.TextSize = 12
     lbl.TextColor3 = COL.unknown
@@ -889,10 +990,37 @@ local function buildRow(name)
         end
     end)
     lbl.MouseEnter:Connect(function()
-        if not killed then lbl.TextColor3 = Color3.new(1, 1, 1) end
+        if killed then return end
+        lbl.TextColor3 = Color3.new(1, 1, 1)
+        if dragState.fromName and dragState.fromName ~= name then
+            dragState.toName = name
+            row.BackgroundColor3 = COL.btnPrimary
+            row.BackgroundTransparency = 0.75
+        end
     end)
     lbl.MouseLeave:Connect(function()
         if not killed then lbl.TextColor3 = colorForResult(state.results[name]) end
+        if dragState.toName == name then
+            dragState.toName = nil
+            row.BackgroundTransparency = 1
+        end
+    end)
+
+    -- manual single-player scan (labeled, not a mystery glyph)
+    local rbtn = Instance.new("TextButton")
+    rbtn.Name = "Scan"
+    rbtn.Size = UDim2.new(0, 34, 0, 18)
+    rbtn.Position = UDim2.new(1, -62, 0, 1)
+    rbtn.BackgroundColor3 = Color3.fromRGB(30, 50, 80)
+    rbtn.BorderSizePixel = 0
+    rbtn.Font = Enum.Font.Code; rbtn.TextSize = 11
+    rbtn.TextColor3 = Color3.fromRGB(150, 200, 255)
+    rbtn.TextTruncate = Enum.TextTruncate.AtEnd
+    rbtn.Text = "Scan"; rbtn.Parent = row
+    Instance.new("UICorner", rbtn).CornerRadius = UDim.new(0, 3)
+    rbtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        if refreshOne then refreshOne(name, rbtn) end
     end)
 
     local btn = Instance.new("TextButton")
@@ -913,12 +1041,6 @@ local function buildRow(name)
         end
         if not removedIdx then return end
         state.results[name] = nil
-        if removedIdx < state.nextIndex then
-            state.nextIndex = math.max(1, state.nextIndex - 1)
-        end
-        if state.nextIndex > #names then
-            state.nextIndex = math.max(1, #names)
-        end
         saveNames(names); saveState(state)
         if playerRows[name] then
             pcall(function() playerRows[name].row:Destroy() end)
@@ -928,7 +1050,7 @@ local function buildRow(name)
         logLine("Removed " .. name)
     end)
 
-    return { row = row, label = lbl, button = btn }
+    return { row = row, label = lbl, button = btn, refresh = rbtn }
 end
 
 local function rebuildRows()
@@ -948,6 +1070,7 @@ end
 local function ensureRow(name)
     if playerRows[name] then return playerRows[name] end
     local r = buildRow(name)
+    r.row.LayoutOrder = 100 + #names   -- appended players stay at the bottom
     playerRows[name] = r
     updateTabCanvas()
     return r
@@ -959,6 +1082,21 @@ local function updatePlayerLabel(name, result)
     r.label.Text = formatLabel(name, result)
     r.label.TextColor3 = colorForResult(result)
 end
+
+-- keep relative ages moving even when a row isn't re-scanned
+local lastAgeTick = 0
+RunService.Heartbeat:Connect(function()
+    if killed then return end
+    local now = tick()
+    if now - lastAgeTick < 1 then return end
+    lastAgeTick = now
+    for name, r in pairs(playerRows) do
+        if r.label and r.label.Parent then
+            local t = formatLabel(name, state.results[name])
+            if r.label.Text ~= t then r.label.Text = t end
+        end
+    end
+end)
 
 local function updateStatusLine(mode, extra)
     if mode then currentMode = mode end
@@ -975,12 +1113,18 @@ local function updateStatusLine(mode, extra)
     end
     local tail = extra
     if not tail then
-        local nextName = names[state.nextIndex]
-        tail = nextName and ("Next: " .. nextName) or "Pass complete"
+        local staleCount = 0
+        for _, n in ipairs(names) do
+            if isStale(n) then staleCount = staleCount + 1 end
+        end
+        if staleCount > 0 then
+            tail = ("%d/%d stale"):format(staleCount, #names)
+        else
+            tail = "all fresh"
+        end
     end
-    statusLbl.Text = ("%s  ●%d ○%d ?%d  ·  %d/%d  ·  %s")
-        :format(currentMode, online, offline, unknown,
-                math.min(state.nextIndex - 1, #names), #names, tail)
+    statusLbl.Text = ("%s  ●%d ○%d ?%d  ·  %s")
+        :format(currentMode, online, offline, unknown, tail)
     local color = COL.idle
     if     currentMode == "Running"  then color = COL.running
     elseif currentMode == "Sleeping" then color = COL.sleeping
@@ -988,6 +1132,30 @@ local function updateStatusLine(mode, extra)
     elseif currentMode == "Error"    then color = COL.error end
     statusLbl.TextColor3 = color
 end
+
+-- ============================================================
+-- Drag commit
+-- ============================================================
+local function commitDrag()
+    local from, to = dragState.fromName, dragState.toName
+    dragState.fromName, dragState.toName = nil, nil
+    clearDragHighlight()
+    if not from or not to or from == to then return end
+    local fi, ti = rowIndexOf(from), rowIndexOf(to)
+    if not fi or not ti then return end
+    table.remove(names, fi)
+    table.insert(names, ti, from)
+    saveNames(names)
+    rebuildRows()
+    updateStatusLine()
+    logLine(("Reordered: %s → %s"):format(from, to))
+end
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 and dragState.fromName then
+        commitDrag()
+    end
+end)
 
 local function addPlayer(raw)
     if killed then return false end
@@ -1065,12 +1233,12 @@ local function makeTextRow(placeholder, defaultText)
     return row, box, btn
 end
 
-local intervalSlider = settingsTab.new("slider", {
-    text = "Interval", size = 110,
+intervalSlider = settingsTab.new("slider", {
+    text = "Offline recheck", size = 110,
     min = CLAMP.interval[1], max = CLAMP.interval[2], value = cfg.interval,
 })
-local passSlider = settingsTab.new("slider", {
-    text = "Pass delay", size = 110,
+passSlider = settingsTab.new("slider", {
+    text = "Scan gap", size = 110,
     min = CLAMP.passDelay[1], max = CLAMP.passDelay[2], value = cfg.passDelay,
 })
 notifySwitch = settingsTab.new("switch", { text = "Notify", on = cfg.notify })
@@ -1085,6 +1253,28 @@ local function widenSliderLabel(slider, w)
 end
 widenSliderLabel(intervalSlider, 240)
 widenSliderLabel(passSlider,     240)
+
+sectionLabel("Recheck timing")
+adaptiveSwitch = settingsTab.new("switch", {
+    text = "Poll online players less often", on = cfg.adaptiveRecheck,
+})
+onlineSlider = settingsTab.new("slider", {
+    text = "Online recheck", size = 110,
+    min = CLAMP.onlineRecheck[1], max = CLAMP.onlineRecheck[2], value = cfg.onlineRecheck,
+})
+widenSliderLabel(onlineSlider, 240)
+
+local recheckHint = Instance.new("TextLabel")
+recheckHint.Size = UDim2.new(1, 0, 0, 28)
+recheckHint.BackgroundTransparency = 1
+recheckHint.Font = Enum.Font.Code
+recheckHint.TextSize = 10
+recheckHint.TextColor3 = COL.unknown
+recheckHint.TextWrapped = true
+recheckHint.TextXAlignment = Enum.TextXAlignment.Left
+recheckHint.Text = "Offline players are polled every Offline recheck (to catch them coming online). "
+    .. "Online players are polled every Online recheck (their server rarely changes)."
+recheckHint.Parent = settingsItems
 
 sectionLabel("Audio alert")
 audioSwitch = settingsTab.new("switch", { text = "Play sound on change", on = cfg.audioEnabled })
@@ -1177,15 +1367,20 @@ local killFullBtn = makeSizedBtn(killRow, "KILL SCRIPT", 0, 220, COL.btnKill)
 -- ============================================================
 -- Getters
 -- ============================================================
-local function getInterval()
-    local v = intervalSlider.value
+function getInterval()
+    local v = intervalSlider and intervalSlider.value
     if type(v) ~= "number" then return cfg.interval end
     return math.clamp(math.floor(v + 0.5), CLAMP.interval[1], CLAMP.interval[2])
 end
-local function getPassDelay()
-    local v = passSlider.value
+function getPassDelay()
+    local v = passSlider and passSlider.value
     if type(v) ~= "number" then return cfg.passDelay end
     return math.clamp(math.floor(v + 0.5), CLAMP.passDelay[1], CLAMP.passDelay[2])
+end
+function getOnlineRecheck()
+    local v = onlineSlider and onlineSlider.value
+    if type(v) ~= "number" then return cfg.onlineRecheck end
+    return math.clamp(math.floor(v + 0.5), CLAMP.onlineRecheck[1], CLAMP.onlineRecheck[2])
 end
 
 -- ============================================================
@@ -1219,80 +1414,142 @@ local function notifyChange(name, result, prevStatus)
 end
 
 -- ============================================================
--- Scan loop
+-- Manual single-player scan
+-- ============================================================
+local refreshing = {}
+refreshOne = function(name, btn)
+    if killed or refreshing[name] then return end
+    refreshing[name] = true
+    if btn and btn.Parent then btn.Text = "…" end
+    local prev = state.results[name]
+    local prevStatus = prev and prev.status or nil
+    task.spawn(function()
+        local result = scanWithTimeout(name)
+        refreshing[name] = nil
+        if btn and btn.Parent then btn.Text = "Scan" end
+        if killed then return end
+        if result.status == "error" then
+            logLine(("Manual refresh failed for %s: %s"):format(name, result.reason or "?"))
+            return
+        end
+        state.results[name] = result
+        saveState(state)
+        notifyChange(name, result, prevStatus)
+        updatePlayerLabel(name, result)
+        updateStatusLine()
+    end)
+end
+
+-- ============================================================
+-- Scan loop — sequential, skip-fresh
 -- ============================================================
 local function stopScan()
     running = false; scanGen = scanGen + 1
     updateStatusLine("Stopped")
 end
 
-local function interruptibleSleep(seconds, myGen, tailLabel)
+local function interruptibleSleep(seconds, myGen, tailLabel, mode)
+    mode = mode or "Sleeping"
     local remaining = math.floor(seconds + 0.5)
     while remaining > 0 and running and scanGen == myGen and not killed do
-        updateStatusLine("Sleeping", ("%s in %ds"):format(tailLabel, remaining))
+        updateStatusLine(mode, ("%s in %ds"):format(tailLabel, remaining))
         local step = math.min(1, remaining)
         task.wait(step); remaining = remaining - step
     end
     if running and scanGen == myGen then currentMode = "Running" end
 end
 
+-- Minimum gap between consecutive scans. Prevents bursts without
+-- turning the loop into a slow drip.
+local lastScanAt = 0
+local function applyScanGap(myGen)
+    local gap = getPassDelay()
+    if gap <= 0 then return true end
+    local since = tick() - lastScanAt
+    local remaining = gap - since
+    if remaining <= 0 then return true end
+    interruptibleSleep(remaining, myGen, "next scan", "Running")
+    return running and scanGen == myGen and not killed
+end
+
 local function scanLoop(myGen)
     while running and scanGen == myGen and not killed do
         if #names == 0 then return end
-        if state.nextIndex > #names then
-            passesDone = passesDone + 1
-            logLine(("Pass %d complete"):format(passesDone))
-            state.nextIndex = 1; saveState(state)
-            local pd = getPassDelay()
-            if pd > 0 then interruptibleSleep(pd, myGen, "next pass") end
-        end
-        if not (running and scanGen == myGen and not killed) then break end
 
-        local name = names[state.nextIndex]
-        if not name then break end
-        local prev = state.results[name]
-        local prevStatus = prev and prev.status or nil
-        local base = getInterval()
+        -- Snapshot the list so a Remove mid-walk doesn't shift indices under us.
+        local passNames = {}
+        for i = 1, #names do passNames[i] = names[i] end
 
-        local result, attempt = nil, 0
-        while true do
-            result = scanWithTimeout(name)
-            if result.status ~= "error" then break end
-            attempt = attempt + 1
-            if attempt > CLAMP.retries then break end
-            local waitS = math.min(base * (2 ^ attempt), CLAMP.maxBackoff)
-            logLine(("Retry %d/%d for %s in %.0fs — %s")
-                :format(attempt, CLAMP.retries, name, waitS, result.reason or "?"))
-            interruptibleSleep(waitS, myGen, ("retrying " .. name))
+        local scanned = 0
+        for _, name in ipairs(passNames) do
             if not (running and scanGen == myGen and not killed) then break end
-        end
-        if not (running and scanGen == myGen and not killed) then break end
 
-        if result.status == "error" then
-            state.results[name] = {
-                status = "unknown", reason = result.reason, at = os.time(),
-            }
-            logLine("UNKNOWN " .. name .. " — " .. (result.reason or "?"))
+            -- Skip names removed while we were walking the snapshot.
+            local live = false
+            for _, n in ipairs(names) do
+                if n == name then live = true; break end
+            end
+            if not live then continue end
+
+            -- Skip fresh data. Only scan what's actually stale.
+            if isStale(name) then
+                if not applyScanGap(myGen) then break end
+                updateStatusLine("Running", "scanning " .. name)
+
+                local prev = state.results[name]
+                local prevStatus = prev and prev.status or nil
+                local base = getInterval()
+
+                local result, attempt = nil, 0
+                while true do
+                    result = scanWithTimeout(name)
+                    if result.status ~= "error" then break end
+                    attempt = attempt + 1
+                    if attempt > CLAMP.retries then break end
+                    local waitS = math.min(base * (2 ^ attempt), CLAMP.maxBackoff)
+                    logLine(("Retry %d/%d for %s in %.0fs — %s")
+                        :format(attempt, CLAMP.retries, name, waitS, result.reason or "?"))
+                    interruptibleSleep(waitS, myGen, "retrying " .. name)
+                    if not (running and scanGen == myGen and not killed) then break end
+                end
+                if not (running and scanGen == myGen and not killed) then break end
+
+                if result.status == "error" then
+                    state.results[name] = {
+                        status = "unknown", reason = result.reason, at = os.time(),
+                    }
+                    logLine("UNKNOWN " .. name .. " — " .. (result.reason or "?"))
+                else
+                    state.results[name] = result
+                    notifyChange(name, result, prevStatus)
+                end
+                updatePlayerLabel(name, state.results[name])
+                saveState(state)
+                scanned = scanned + 1
+                lastScanAt = tick()
+
+                local now = os.time()
+                if cfg.showScores and (now - lastServerFetch) >= CLAMP.scoreRefresh then
+                    lastServerFetch = now
+                    task.spawn(fetchServerPage)
+                end
+            end
+        end
+
+        if scanned == 0 then
+            -- Nothing stale in this walk. Sleep until the soonest goes stale.
+            local wait = timeUntilNextStale()
+            if wait <= 0 then wait = 0.1 end
+            wait = math.min(wait, 30)
+            local endAt = tick() + wait
+            while tick() < endAt and running and scanGen == myGen and not killed do
+                local remaining = math.ceil(endAt - tick())
+                updateStatusLine("Running", ("all fresh — next in %ds"):format(remaining))
+                task.wait(0.5)
+            end
         else
-            state.results[name] = result
-            notifyChange(name, result, prevStatus)
+            updateStatusLine("Running")
         end
-        updatePlayerLabel(name, state.results[name])
-
-        state.nextIndex = state.nextIndex + 1
-        saveState(state); updateStatusLine("Running")
-
-        local now = os.time()
-        if cfg.showScores and (now - lastServerFetch) >= CLAMP.scoreRefresh then
-            lastServerFetch = now
-            task.spawn(fetchServerPage)
-        end
-
-        local sleep = getInterval()
-        if result.status == "error" then
-            sleep = math.min(sleep * 2, CLAMP.maxBackoff)
-        end
-        interruptibleSleep(sleep, myGen, "next scan")
     end
 end
 
@@ -1320,7 +1577,7 @@ end
 
 local function resetScanState()
     running = false; scanGen = scanGen + 1
-    state = { version = 2, nextIndex = 1, results = {} }
+    state = { version = 3, results = {} }
     saveState(state)
     for name in pairs(playerRows) do
         local r = playerRows[name]
@@ -1329,7 +1586,6 @@ local function resetScanState()
             r.label.TextColor3 = COL.unknown
         end
     end
-    passesDone = 0
     logLine("State reset"); updateStatusLine("Stopped")
 end
 
@@ -1359,7 +1615,7 @@ local function killEverything()
             if child.Name == "Main" then stillUsed = true; break end
         end
         if not stillUsed then imgui:Destroy() end
-        end)
+    end)
     end)
 
     _G.Scanner = nil
@@ -1378,6 +1634,8 @@ local function currentUIAsConfig()
     return {
         interval  = getInterval(),
         passDelay = getPassDelay(),
+        onlineRecheck = getOnlineRecheck(),
+        adaptiveRecheck = adaptiveSwitch.on,
         notify    = notifySwitch.on,
         autoStart = autoSwitch.on,
         showScores = scoreSwitch.on,
@@ -1404,6 +1662,7 @@ reloadBtn.MouseButton1Click:Connect(function()
     if killed then return end
     cfg = loadConfig()
     intervalSlider.set(cfg.interval); passSlider.set(cfg.passDelay)
+    onlineSlider.set(cfg.onlineRecheck); adaptiveSwitch.set(cfg.adaptiveRecheck)
     notifySwitch.set(cfg.notify); autoSwitch.set(cfg.autoStart)
     scoreSwitch.set(cfg.showScores)
     audioSwitch.set(cfg.audioEnabled); audioBox.Text = cfg.audioId
@@ -1416,6 +1675,8 @@ defaultBtn.MouseButton1Click:Connect(function()
     if killed then return end
     intervalSlider.set(HARD_DEFAULTS.interval)
     passSlider.set(HARD_DEFAULTS.passDelay)
+    onlineSlider.set(HARD_DEFAULTS.onlineRecheck)
+    adaptiveSwitch.set(HARD_DEFAULTS.adaptiveRecheck)
     notifySwitch.set(HARD_DEFAULTS.notify)
     autoSwitch.set(HARD_DEFAULTS.autoStart)
     scoreSwitch.set(HARD_DEFAULTS.showScores)
@@ -1594,9 +1855,14 @@ updateStatusLine("Idle")
 if scanTab and scanTab.show then pcall(function() scanTab.show() end) end
 task.defer(enforceTabLayout)
 
+if cfg.autoStart and #names > 0 then
+    task.defer(startScan)
+end
+
 _G.Scanner = {
     stop = stopScan, start = startScan, reset = resetScanState,
     kill = killEverything,
+    refreshOne = function(n) if refreshOne then refreshOne(n) end end,
     refreshPlaces = function(cb) refreshPlaces(cb) end,
     places = function() return places end,
     placesCount = placesCount,
