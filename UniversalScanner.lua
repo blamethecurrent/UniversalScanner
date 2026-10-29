@@ -1,8 +1,11 @@
 --[[
-    UniversalScanner — rbimgui-2 UI (v12)
+    UniversalScanner — rbimgui-2 UI (v13)
     v10: original
     v11: age display, drag-reorder, labeled Scan button, autostart wiring
     v12: sequential skip-fresh scan loop; separate offline/online recheck intervals
+    v13: tick-based queue (expired players are scanned on each tick, not the instant
+         they expire); per-status expiry; notify + webhook on subplace/server change;
+         avatar headshots; up/down/drag reordering; nearly everything configurable in UI
 ]]
 
 -- ============================================================
@@ -53,22 +56,36 @@ local SEED_PLACES = {
     { id = 125444254609144, name = "UF: Gameplay Without Stamina" },
 }
 
+-- Numeric settings: each one gets a slider in the Settings tab.
+local NUMS = {
+    { key = "interval",       label = "Check for updates every (seconds)",          min = 1, max = 60,   def = 5   },
+    { key = "batchSize",      label = "Players looked up per check",    min = 1, max = 50,  def = 1   },
+    { key = "passDelay",      label = "Pause between lookups in a check (seconds)",   min = 0, max = 60,   def = 1   },
+    { key = "expireOnline",   label = "Online result stays current for (seconds)",      min = 5, max = 3600, def = 60  },
+    { key = "expireOffline",  label = "Offline result stays current for (seconds)",     min = 1, max = 3600, def = 5   },
+    { key = "expireNotFound", label = "Not-found result stays current for (seconds)",   min = 5, max = 3600, def = 120 },
+    { key = "expireUnknown",  label = "Failed lookup stays current for (seconds)", min = 1, max = 600, def = 10 },
+    { key = "timeout",        label = "Give up on a lookup after (seconds)",        min = 5, max = 120,  def = 30  },
+    { key = "retries",        label = "Retry failed lookups (times)",        min = 0, max = 5,    def = 2   },
+    { key = "maxBackoff",     label = "Longest wait between retries (seconds)",   min = 5, max = 300,  def = 60  },
+    { key = "scoreRefresh",   label = "Refresh game scores every (seconds)",       min = 3, max = 120,  def = 10  },
+    { key = "uiScale",        label = "Menu size (percent)",            min = 50, max = 200, def = 100 },
+    { key = "scoreTTL",       label = "Keep game scores for (seconds)",     min = 10, max = 600, def = 120 },
+}
+local NUM_BY_KEY = {}
+for _, f in ipairs(NUMS) do NUM_BY_KEY[f.key] = f end
+
+local CLAMP = { windowW = { 380, 800 }, windowH = { 240, 720 } }
+
 local HARD_DEFAULTS = {
-    version = 3, interval = 5, passDelay = 1,
+    version = 4,
     notify = true, autoStart = true,
     audioEnabled = false, audioId = "",
     webhookEnabled = false, webhookUrl = "",
-    showScores = true,
-    adaptiveRecheck = true, onlineRecheck = 60,
+    showScores = true, showAvatars = true,
     windowW = 470, windowH = 520,
 }
-local CLAMP = {
-    interval  = { 3, 30 }, passDelay = { 0, 300 },
-    onlineRecheck = { 15, 600 },
-    windowW   = { 380, 800 }, windowH = { 240, 720 },
-    retries   = 2, timeout = 30, maxBackoff = 60,
-    scoreRefresh = 10, scoreTTL = 120,
-}
+for _, f in ipairs(NUMS) do HARD_DEFAULTS[f.key] = f.def end
 
 -- ============================================================
 -- Services
@@ -272,25 +289,26 @@ local function clampInt(v, lo, hi, fb)
     return math.clamp(math.floor(v + 0.5), lo, hi)
 end
 local function cleanAudioId(s)
-    return tostring(s or ""):gsub("%D", "")
+    return (tostring(s or ""):gsub("%D", ""))
 end
 local function sanitizeConfig(c)
-    return {
-        version        = 3,
-        interval       = clampInt(c.interval,  CLAMP.interval[1],  CLAMP.interval[2],  HARD_DEFAULTS.interval),
-        passDelay      = clampInt(c.passDelay, CLAMP.passDelay[1], CLAMP.passDelay[2], HARD_DEFAULTS.passDelay),
-        onlineRecheck  = clampInt(c.onlineRecheck, CLAMP.onlineRecheck[1], CLAMP.onlineRecheck[2], HARD_DEFAULTS.onlineRecheck),
+    local out = {
+        version        = 4,
         notify         = c.notify    == true,
         autoStart      = c.autoStart == true,
-        adaptiveRecheck = c.adaptiveRecheck ~= false,
         audioEnabled   = c.audioEnabled == true,
         audioId        = cleanAudioId(c.audioId),
         webhookEnabled = c.webhookEnabled == true,
         webhookUrl     = tostring(c.webhookUrl or ""),
         showScores     = c.showScores ~= false,
+        showAvatars    = c.showAvatars ~= false,
         windowW        = clampInt(c.windowW, CLAMP.windowW[1], CLAMP.windowW[2], HARD_DEFAULTS.windowW),
         windowH        = clampInt(c.windowH, CLAMP.windowH[1], CLAMP.windowH[2], HARD_DEFAULTS.windowH),
     }
+    for _, f in ipairs(NUMS) do
+        out[f.key] = clampInt(c[f.key], f.min, f.max, f.def)
+    end
+    return out
 end
 local function loadConfig()
     if not fileExists(CONFIG_PATH) then
@@ -303,6 +321,11 @@ local function loadConfig()
     if not raw then return sanitizeConfig(HARD_DEFAULTS) end
     local ok, d = pcall(function() return HttpService:JSONDecode(raw) end)
     if not ok or type(d) ~= "table" then return sanitizeConfig(HARD_DEFAULTS) end
+    -- migrate pre-v4 configs
+    if (tonumber(d.version) or 0) < 4 then
+        if d.expireOffline == nil then d.expireOffline = d.interval end
+        if d.expireOnline  == nil then d.expireOnline  = d.onlineRecheck end
+    end
     return sanitizeConfig(d)
 end
 local function saveConfig(c)
@@ -333,12 +356,13 @@ local function loadState()
     if raw then
         local ok, d = pcall(function() return HttpService:JSONDecode(raw) end)
         if ok and type(d) == "table" then
-            d.nextIndex = nil        -- v3: no longer index-driven
+            d.nextIndex = nil
             d.results   = d.results or {}
+            d.userIds   = d.userIds or {}
             return d
         end
     end
-    return { version = 3, results = {} }
+    return { version = 3, results = {}, userIds = {} }
 end
 local function saveState(s)
     local ok, e = pcall(function() return HttpService:JSONEncode(s) end)
@@ -360,6 +384,41 @@ local cfg   = loadConfig()
 local names = loadNames()
 local state = loadState()
 pruneState(state, names)
+
+-- ============================================================
+-- Forward-declared UI handles + live-value getters
+-- ============================================================
+local numBoxes = {}  -- key -> TextBox for each numeric setting
+local notifySwitch, audioSwitch, webhookSwitch, scoreSwitch, autoSwitch, avatarSwitch
+local audioBox, webhookBox
+local updateStatusLine   -- forward declaration (assigned below)
+
+-- Live value of a numeric setting (text box if it exists, else saved config).
+-- Anything typed that isn't a number falls back to the saved value; out-of-range
+-- numbers are clamped.
+local function getNum(key)
+    local f = NUM_BY_KEY[key]
+    local b = numBoxes[key]
+    local v = b and tonumber(b.Text)
+    if type(v) ~= "number" then v = cfg[key] end
+    if type(v) ~= "number" then v = f.def end
+    return math.clamp(math.floor(v + 0.5), f.min, f.max)
+end
+-- Live value of a toggle
+local function flag(sw, key)
+    if sw and sw.on ~= nil then return sw.on == true end
+    return cfg[key] == true
+end
+
+-- user-id helpers (state-based; no UI needed)
+local function knownUserId(name)
+    local r = state.results[name]
+    if r and tonumber(r.userId) and tonumber(r.userId) > 0 then
+        state.userIds[name:lower()] = tonumber(r.userId)
+        return tonumber(r.userId)
+    end
+    return tonumber(state.userIds[name:lower()])
+end
 
 -- ============================================================
 -- Game remote + scanning
@@ -435,7 +494,7 @@ local function scanPlayer(name)
         }
     elseif displayName ~= "" then
         return {
-            status = "offline", displayName = displayName,
+            status = "offline", displayName = displayName, userId = userId,
             exactMatch = exactMatch, at = os.time(),
             playerCount = playerCount, maxPlayers = maxPlayers,
         }
@@ -447,8 +506,8 @@ end
 local function scanWithTimeout(name)
     local done, result = false, nil
     task.spawn(function() result = scanPlayer(name); done = true end)
-    local elapsed = 0
-    while not done and elapsed < CLAMP.timeout do
+    local elapsed, limit = 0, getNum("timeout")
+    while not done and elapsed < limit do
         task.wait(0.1); elapsed = elapsed + 0.1
     end
     if not done then return { status = "error", reason = "timeout" } end
@@ -489,26 +548,16 @@ local function fetchServerPage()
 end
 
 local function scoreTag(jobId, fallbackCount, fallbackMax)
-    if not cfg.showScores and not (fallbackCount and fallbackMax and tonumber(fallbackMax) > 0) then
-        return ""
-    end
-
     local s = serverCache[jobId]
-    if s and (os.time() - s.at) <= CLAMP.scoreTTL then
+    if flag(scoreSwitch, "showScores") and s and (os.time() - s.at) <= getNum("scoreTTL") then
         local count = tonumber(s.count) or tonumber(fallbackCount) or 0
         local max = tonumber(s.max) or tonumber(fallbackMax) or 0
         if max > 0 or count > 0 then
             return (" · %d/%d"):format(count, max)
         end
-        return ""
     end
-
-    if fallbackCount and fallbackMax and tonumber(fallbackMax) > 0 then
+    if fallbackCount and fallbackMax and tonumber(fallbackMax) and tonumber(fallbackMax) > 0 then
         return (" · %d/%d"):format(tonumber(fallbackCount), tonumber(fallbackMax))
-    end
-
-    if config and not cfg.showScores then
-        return ""
     end
     return ""
 end
@@ -516,13 +565,22 @@ end
 -- ============================================================
 -- Load UI lib
 -- ============================================================
-local src = httpRequest({ Url = LIB_URL, Method = "GET" })
-if not src or #src < 1000 or src:sub(1, 1) == "<" then
-    error(("[Scanner] Could not fetch rbimgui-2 source (got %s)")
-        :format(src and (#src .. " bytes, starts with '" .. src:sub(1, 1) .. "'") or "nil"))
+local ImGui
+do
+    local function fetchLib(url)
+        local s = httpRequest({ Url = url, Method = "GET" })
+        if not s or #s < 1000 or s:sub(1, 1) == "<" then return nil, s end
+        return s
+    end
+    local src, bad = fetchLib(LIB_URL)
+    if not src then
+        error(("[Scanner] Could not fetch rbimgui-2 source (got %s)")
+            :format(bad and (#bad .. " bytes, starts with '" .. bad:sub(1, 1) .. "'") or "nil"))
+    end
+    local okLoad, lib = pcall(function() return loadstring(src)() end)
+    if not okLoad or not lib then error("[Scanner] Lib load failed: " .. tostring(lib)) end
+    ImGui = lib
 end
-local okLoad, ImGui = pcall(function() return loadstring(src)() end)
-if not okLoad or not ImGui then error("[Scanner] Lib load failed: " .. tostring(ImGui)) end
 
 -- ============================================================
 -- Colors
@@ -580,42 +638,34 @@ end
 local mainFrame    = findMainFrame(WIN_TITLE)
 local contentFrame = mainFrame and mainFrame:FindFirstChild("Content")
 
+-- Current menu zoom (1 = 100%). Used so window sizes stay in unscaled units.
+local function getScale()
+    local u = mainFrame and mainFrame:FindFirstChildOfClass("UIScale")
+    return u and u.Scale or 1
+end
+
 -- ============================================================
--- Runtime flags + forward-declared refs
+-- Runtime flags
 -- ============================================================
 local running     = false
 local scanGen     = 0
 local currentMode = "Idle"
 local killed      = false
 
-local notifySwitch, audioSwitch, webhookSwitch, scoreSwitch, autoSwitch
-local adaptiveSwitch, onlineSlider
-local audioBox, webhookBox
-local intervalSlider, passSlider
-local getInterval, getPassDelay, getOnlineRecheck
-
 -- ============================================================
 -- Toast
 -- ============================================================
-local toast
-local function defineToast()
-    toast = function(title, text)
-        pcall(function()
-            StarterGui:SetCore("SendNotification",
-                { Title = title, Text = text, Duration = 4 })
-        end)
-    end
+local function toast(title, text)
+    pcall(function()
+        StarterGui:SetCore("SendNotification",
+            { Title = title, Text = text, Duration = 4 })
+    end)
 end
-defineToast()
 
 -- ============================================================
 -- Audio alert
 -- ============================================================
-local function playAlert()
-    if killed then return end
-    if not audioSwitch or not audioSwitch.on then return end
-    local id = audioBox and tonumber(cleanAudioId(audioBox.Text)) or nil
-    if not id or id <= 0 then return end
+local function playSound(id)
     local s = Instance.new("Sound")
     s.SoundId = "rbxassetid://" .. id
     s.Volume = 0.6
@@ -623,6 +673,14 @@ local function playAlert()
     pcall(function() SoundService:PlayLocalSound(s) end)
     pcall(function() s:Play() end)
     task.delay(6, function() pcall(function() s:Destroy() end) end)
+end
+
+local function playAlert()
+    if killed then return end
+    if not flag(audioSwitch, "audioEnabled") then return end
+    local id = audioBox and tonumber(cleanAudioId(audioBox.Text)) or nil
+    if not id or id <= 0 then return end
+    playSound(id)
 end
 
 -- ============================================================
@@ -634,7 +692,7 @@ local function deepLink(placeId, jobId)
 end
 
 local function sendWebhook(payload)
-    if killed or not webhookSwitch or not webhookSwitch.on then return end
+    if killed or not flag(webhookSwitch, "webhookEnabled") then return end
     local url = webhookBox and webhookBox.Text or ""
     if not url:match("^https://discord") then return end
     local ok, body = pcall(function() return HttpService:JSONEncode(payload) end)
@@ -648,25 +706,61 @@ local function sendWebhook(payload)
     end)
 end
 
-local function webhookStatus(name, result, prevStatus, scoreStr)
-    if killed or not webhookSwitch or not webhookSwitch.on then return end
-    local isOnline  = result.status == "online"
-    local isOffline = result.status == "offline"
-    if not isOnline and not isOffline then return end
-    if isOnline  and prevStatus == "online" then return end
-    if isOffline and prevStatus ~= "online" then return end
+local headshotCache = {}
+local function fetchHeadshotUrl(uid)
+    if not uid then return nil end
+    if headshotCache[uid] then return headshotCache[uid] end
+    local body = httpRequest({
+        Url = ("https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=%d&size=150x150&format=Png&isCircular=false")
+            :format(uid),
+        Method = "GET",
+    })
+    if not body then return nil end
+    local ok, d = pcall(function() return HttpService:JSONDecode(body) end)
+    local url = ok and type(d) == "table" and d.data and d.data[1] and d.data[1].imageUrl
+    if type(url) == "string" and url:sub(1, 4) == "http" then
+        headshotCache[uid] = url
+        return url
+    end
+end
 
-    local title = isOnline and "Player Online" or "Player Offline"
-    local color = isOnline and 0x5ADC82 or 0xDC5A5A
-    local desc  = isOnline
-        and ("**%s** is online"):format(result.displayName or name)
-        or  ("**%s** went offline"):format(name)
+local EVENT_STYLE = {
+    online   = { title = "Player Online",            color = 0x5ADC82 },
+    offline  = { title = "Player Offline",           color = 0xDC5A5A },
+    subplace = { title = "Player Changed Subplace",  color = 0x5A82DC },
+    server   = { title = "Player Changed Server",    color = 0xDCB45A },
+}
+
+local function placeLabel(r)
+    if not r then return "?" end
+    if r.placeName and r.placeName ~= "" then return r.placeName end
+    if r.placeId then return places[r.placeId] or ("Place " .. tostring(r.placeId)) end
+    return "?"
+end
+
+local function webhookEvent(name, result, prev, event, scoreStr)
+    if killed or not flag(webhookSwitch, "webhookEnabled") then return end
+    local style = EVENT_STYLE[event]
+    if not style then return end
+
+    local who = result.displayName and result.displayName ~= "" and result.displayName or name
+    local desc
+    if event == "online" then
+        desc = ("**%s** is online"):format(who)
+    elseif event == "offline" then
+        desc = ("**%s** went offline"):format(name)
+    elseif event == "subplace" then
+        desc = ("**%s** moved: %s → %s"):format(who, placeLabel(prev), placeLabel(result))
+    else
+        desc = ("**%s** switched servers in %s"):format(who, placeLabel(result))
+    end
 
     local fields = {}
-    if isOnline then
-        if result.placeName then
-            table.insert(fields, { name = "Place", value = result.placeName, inline = true })
+    if event ~= "offline" then
+        if event == "subplace" then
+            table.insert(fields, { name = "From", value = placeLabel(prev), inline = true })
         end
+        table.insert(fields, { name = "Place", value = placeLabel(result), inline = true })
         if result.jobId and result.jobId ~= "" then
             table.insert(fields, {
                 name = "Server",
@@ -692,14 +786,19 @@ local function webhookStatus(name, result, prevStatus, scoreStr)
         end
     end
 
-    sendWebhook({
-        username = "UniversalScanner",
-        embeds = {{
-            title = title, description = desc, color = color, fields = fields,
-            footer = { text = "UF Player Scanner" },
-            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        }},
-    })
+    local uid = tonumber(result.userId) or knownUserId(name)
+    task.spawn(function()
+        local thumb = fetchHeadshotUrl(uid)
+        sendWebhook({
+            username = "UniversalScanner",
+            embeds = {{
+                title = style.title, description = desc, color = style.color, fields = fields,
+                thumbnail = thumb and { url = thumb } or nil,
+                footer = { text = "UF Player Scanner" },
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            }},
+        })
+    end)
 end
 
 -- ============================================================
@@ -753,9 +852,12 @@ end)
 -- PLAYERS TAB
 -- ============================================================
 local scanTab = window.new({ text = "Players" })
-local tmp = scanTab.new("label", { text = "" })
-local tabItems = tmp.self.Parent
-tmp.self:Destroy()
+local tabItems
+do
+    local tmp = scanTab.new("label", { text = "" })
+    tabItems = tmp.self.Parent
+    tmp.self:Destroy()
+end
 
 tabItems.Size = UDim2.new(1, -20, 1, -46)
 tabItems.ScrollingDirection = Enum.ScrollingDirection.Y
@@ -809,7 +911,7 @@ playersHeader.BackgroundTransparency = 1
 playersHeader.Font = Enum.Font.Code; playersHeader.TextSize = 12
 playersHeader.TextColor3 = COL.idle
 playersHeader.TextXAlignment = Enum.TextXAlignment.Left
-playersHeader.Text = "Players:"; playersHeader.Parent = tabItems
+playersHeader.Text = "Players (▲▼ or drag ⋮ to reorder):"; playersHeader.Parent = tabItems
 
 local ctrlBar = Instance.new("Frame")
 ctrlBar.Name = "CtrlBar"
@@ -840,7 +942,6 @@ local resetBtn = makeCtrlBtn("Reset", 172, 80, COL.btnMuted)
 -- ============================================================
 local playerRows = {}
 
--- drag-reorder state
 local dragState = { fromName = nil, toName = nil }
 local function rowIndexOf(nm)
     for i, n in ipairs(names) do if n == nm then return i end end
@@ -943,47 +1044,90 @@ local function updateTabCanvas()
 end
 
 -- ============================================================
--- Recheck helpers
---   Offline / unknown / notfound -> every Offline recheck
---   Online                       -> every Online recheck (if adaptive on)
+-- Expiry (per status) + staleness
 -- ============================================================
-local function thresholdFor(r)
-    local t = cfg.interval
-    if getInterval then t = getInterval() end
-    if r and r.status == "online" then
-        local adaptive = cfg.adaptiveRecheck
-        if adaptiveSwitch then adaptive = adaptiveSwitch.on end
-        if adaptive then
-            local online = cfg.onlineRecheck
-            if getOnlineRecheck then online = getOnlineRecheck() end
-            if online > t then t = online end
-        end
-    end
-    return t
+local function expiryFor(r)
+    local s = r and r.status
+    if s == "online"   then return getNum("expireOnline")   end
+    if s == "offline"  then return getNum("expireOffline")  end
+    if s == "notfound" then return getNum("expireNotFound") end
+    return getNum("expireUnknown")
 end
 
 local function isStale(name)
     local r = state.results[name]
     if not r or not r.at then return true end
-    return (os.time() - r.at) >= thresholdFor(r)
+    return (os.time() - r.at) >= expiryFor(r)
 end
 
-local function timeUntilNextStale()
-    local now = os.time()
-    local soonest = math.huge
-    for _, n in ipairs(names) do
-        local r = state.results[n]
-        if not r or not r.at then return 0 end
-        local untilStale = (r.at + thresholdFor(r)) - now
-        if untilStale < soonest then soonest = untilStale end
+-- ============================================================
+-- Reordering
+-- ============================================================
+local function applyRowOrder()
+    for i, n in ipairs(names) do
+        local r = playerRows[n]
+        if r and r.row and r.row.Parent then r.row.LayoutOrder = 100 + i end
     end
-    return soonest
+end
+
+local function moveName(name, newIdx)
+    local fi = rowIndexOf(name)
+    if not fi or #names < 2 then return end
+    newIdx = math.clamp(newIdx, 1, #names)
+    if newIdx == fi then return end
+    table.remove(names, fi)
+    table.insert(names, newIdx, name)
+    saveNames(names)
+    applyRowOrder()
+    logLine(("Moved %s to position %d"):format(name, newIdx))
+end
+
+-- ============================================================
+-- Avatars
+-- ============================================================
+local function avatarImage(uid)
+    return ("rbxthumb://type=AvatarHeadShot&id=%d&w=48&h=48"):format(uid)
+end
+
+local resolving, lookupFailedAt = {}, {}
+local function updateAvatar(name)
+    local r = playerRows[name]
+    if not r or not r.avatar or not r.avatar.Parent then return end
+    local show = flag(avatarSwitch, "showAvatars")
+    r.avatar.Visible = show
+    local x = show and 38 or 16
+    r.label.Position = UDim2.new(0, x, 0, 0)
+    r.label.Size = UDim2.new(1, -(x + 106), 1, 0)
+    if not show then return end
+
+    local uid = knownUserId(name)
+    if uid then
+        local img = avatarImage(uid)
+        if r.avatar.Image ~= img then r.avatar.Image = img end
+        return
+    end
+    if resolving[name] then return end
+    if lookupFailedAt[name] and (os.time() - lookupFailedAt[name]) < 300 then return end
+    resolving[name] = true
+    task.spawn(function()
+        local ok, id = pcall(Players.GetUserIdFromNameAsync, Players, name)
+        resolving[name] = nil
+        if killed then return end
+        id = ok and tonumber(id) or nil
+        if id then
+            state.userIds[name:lower()] = id
+            saveState(state)
+            updateAvatar(name)
+        else
+            lookupFailedAt[name] = os.time()
+        end
+    end)
 end
 
 local function buildRow(name)
     local row = Instance.new("Frame")
     row.Name = "Row_" .. name; row.LayoutOrder = 100
-    row.Size = UDim2.new(1, 0, 0, 20)
+    row.Size = UDim2.new(1, 0, 0, 24)
     row.BackgroundTransparency = 1; row.Parent = tabItems
 
     -- drag grip
@@ -1001,10 +1145,21 @@ local function buildRow(name)
         dragState.toName = nil
     end)
 
+    -- avatar headshot
+    local avatar = Instance.new("ImageLabel")
+    avatar.Name = "Avatar"
+    avatar.Size = UDim2.new(0, 20, 0, 20)
+    avatar.Position = UDim2.new(0, 16, 0, 2)
+    avatar.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    avatar.BorderSizePixel = 0
+    avatar.Image = ""
+    avatar.Parent = row
+    Instance.new("UICorner", avatar).CornerRadius = UDim.new(1, 0)
+
     local lbl = Instance.new("TextLabel")
     lbl.Name = "Lbl"
-    lbl.Size = UDim2.new(1, -80, 1, 0)
-    lbl.Position = UDim2.new(0, 14, 0, 0)
+    lbl.Size = UDim2.new(1, -144, 1, 0)
+    lbl.Position = UDim2.new(0, 38, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Font = Enum.Font.Code; lbl.TextSize = 12
     lbl.TextColor3 = COL.unknown
@@ -1029,7 +1184,7 @@ local function buildRow(name)
             toast("Scanner", "'" .. name .. "' doesn't exist")
         end
     end)
-    lbl.MouseEnter:Connect(function()
+    local function hoverIn()
         if killed then return end
         lbl.TextColor3 = Color3.new(1, 1, 1)
         if dragState.fromName and dragState.fromName ~= name then
@@ -1037,42 +1192,56 @@ local function buildRow(name)
             row.BackgroundColor3 = COL.btnPrimary
             row.BackgroundTransparency = 0.75
         end
-    end)
-    lbl.MouseLeave:Connect(function()
+    end
+    local function hoverOut()
         if not killed then lbl.TextColor3 = colorForResult(state.results[name]) end
         if dragState.toName == name then
             dragState.toName = nil
             row.BackgroundTransparency = 1
         end
+    end
+    lbl.MouseEnter:Connect(hoverIn)
+    lbl.MouseLeave:Connect(hoverOut)
+    avatar.MouseEnter:Connect(function()
+        if killed then return end
+        if dragState.fromName and dragState.fromName ~= name then
+            dragState.toName = name
+            row.BackgroundColor3 = COL.btnPrimary
+            row.BackgroundTransparency = 0.75
+        end
     end)
 
-    -- manual single-player scan (labeled, not a mystery glyph)
-    local rbtn = Instance.new("TextButton")
-    rbtn.Name = "Scan"
-    rbtn.Size = UDim2.new(0, 34, 0, 18)
-    rbtn.Position = UDim2.new(1, -62, 0, 1)
-    rbtn.BackgroundColor3 = Color3.fromRGB(30, 50, 80)
-    rbtn.BorderSizePixel = 0
-    rbtn.Font = Enum.Font.Code; rbtn.TextSize = 11
-    rbtn.TextColor3 = Color3.fromRGB(150, 200, 255)
-    rbtn.TextTruncate = Enum.TextTruncate.AtEnd
-    rbtn.Text = "Scan"; rbtn.Parent = row
-    Instance.new("UICorner", rbtn).CornerRadius = UDim.new(0, 3)
+    local function smallBtn(text, x, w, bg, fg, size)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(0, w, 0, 18)
+        b.Position = UDim2.new(1, x, 0, 3)
+        b.BackgroundColor3 = bg
+        b.BorderSizePixel = 0
+        b.Font = Enum.Font.Code; b.TextSize = size or 11
+        b.TextColor3 = fg
+        b.TextTruncate = Enum.TextTruncate.AtEnd
+        b.Text = text; b.Parent = row
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 3)
+        return b
+    end
+
+    local upBtn   = smallBtn("▲", -102, 18, Color3.fromRGB(40, 45, 65), Color3.fromRGB(200, 210, 240), 10)
+    local downBtn = smallBtn("▼", -82,  18, Color3.fromRGB(40, 45, 65), Color3.fromRGB(200, 210, 240), 10)
+    local rbtn    = smallBtn("Scan", -60, 34, Color3.fromRGB(30, 50, 80), Color3.fromRGB(150, 200, 255), 11)
+    local btn     = smallBtn("×", -24, 22, Color3.fromRGB(70, 30, 30), Color3.fromRGB(255, 150, 150), 12)
+
+    upBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        local i = rowIndexOf(name); if i then moveName(name, i - 1) end
+    end)
+    downBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        local i = rowIndexOf(name); if i then moveName(name, i + 1) end
+    end)
     rbtn.MouseButton1Click:Connect(function()
         if killed then return end
         if refreshOne then refreshOne(name, rbtn) end
     end)
-
-    local btn = Instance.new("TextButton")
-    btn.Name = "Remove"; btn.Size = UDim2.new(0, 24, 0, 18)
-    btn.Position = UDim2.new(1, -26, 0, 1)
-    btn.BackgroundColor3 = Color3.fromRGB(70, 30, 30)
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.Code; btn.TextSize = 12
-    btn.TextColor3 = Color3.fromRGB(255, 150, 150)
-    btn.Text = "×"; btn.Parent = row
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 3)
-
     btn.MouseButton1Click:Connect(function()
         if killed then return end
         local removedIdx
@@ -1086,11 +1255,12 @@ local function buildRow(name)
             pcall(function() playerRows[name].row:Destroy() end)
             playerRows[name] = nil
         end
+        applyRowOrder()
         updateTabCanvas(); updateStatusLine()
         logLine("Removed " .. name)
     end)
 
-    return { row = row, label = lbl, button = btn, refresh = rbtn }
+    return { row = row, label = lbl, button = btn, refresh = rbtn, avatar = avatar }
 end
 
 local function rebuildRows()
@@ -1103,6 +1273,7 @@ local function rebuildRows()
         local res = state.results[name]
         r.label.Text = formatLabel(name, res)
         r.label.TextColor3 = colorForResult(res)
+        updateAvatar(name)
     end
     updateTabCanvas()
 end
@@ -1110,8 +1281,9 @@ end
 local function ensureRow(name)
     if playerRows[name] then return playerRows[name] end
     local r = buildRow(name)
-    r.row.LayoutOrder = 100 + #names   -- appended players stay at the bottom
+    r.row.LayoutOrder = 100 + #names
     playerRows[name] = r
+    updateAvatar(name)
     updateTabCanvas()
     return r
 end
@@ -1121,10 +1293,12 @@ local function updatePlayerLabel(name, result)
     if not r or not r.label.Parent then return end
     r.label.Text = formatLabel(name, result)
     r.label.TextColor3 = colorForResult(result)
+    updateAvatar(name)
 end
 
--- keep relative ages moving even when a row isn't re-scanned
+-- keep relative ages moving; also apply avatar toggle changes
 local lastAgeTick = 0
+local avatarsShown = nil
 RunService.Heartbeat:Connect(function()
     if killed then return end
     local now = tick()
@@ -1136,9 +1310,14 @@ RunService.Heartbeat:Connect(function()
             if r.label.Text ~= t then r.label.Text = t end
         end
     end
+    local want = flag(avatarSwitch, "showAvatars")
+    if want ~= avatarsShown then
+        avatarsShown = want
+        for name in pairs(playerRows) do updateAvatar(name) end
+    end
 end)
 
-local function updateStatusLine(mode, extra)
+function updateStatusLine(mode, extra)
     if mode then currentMode = mode end
     if killed then return end
     local online, offline, unknown = 0, 0, 0
@@ -1158,7 +1337,7 @@ local function updateStatusLine(mode, extra)
             if isStale(n) then staleCount = staleCount + 1 end
         end
         if staleCount > 0 then
-            tail = ("%d/%d stale"):format(staleCount, #names)
+            tail = ("%d/%d expired"):format(staleCount, #names)
         else
             tail = "all fresh"
         end
@@ -1181,14 +1360,10 @@ local function commitDrag()
     dragState.fromName, dragState.toName = nil, nil
     clearDragHighlight()
     if not from or not to or from == to then return end
-    local fi, ti = rowIndexOf(from), rowIndexOf(to)
-    if not fi or not ti then return end
-    table.remove(names, fi)
-    table.insert(names, ti, from)
-    saveNames(names)
-    rebuildRows()
+    local ti = rowIndexOf(to)
+    if not ti then return end
+    moveName(from, ti)
     updateStatusLine()
-    logLine(("Reordered: %s → %s"):format(from, to))
 end
 
 UserInputService.InputEnded:Connect(function(input)
@@ -1218,241 +1393,66 @@ addBox.FocusLost:Connect(function(enter)
 end)
 
 -- ============================================================
--- SETTINGS TAB
+-- Notifications (online / offline / subplace / server change)
 -- ============================================================
-local settingsTab = window.new({ text = "Settings" })
-local stmp = settingsTab.new("label", { text = "" })
-local settingsItems = stmp.self.Parent
-stmp.self:Destroy()
-
-local function sectionLabel(text, color)
-    local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, 0, 0, 16)
-    l.BackgroundTransparency = 1
-    l.Font = Enum.Font.Code; l.TextSize = 11
-    l.TextColor3 = color or COL.idle
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.Text = text; l.Parent = settingsItems
-    return l
-end
-
-local function makeSizedBtn(parent, text, xPos, width, bg)
-    local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0, width, 0, 26)
-    b.Position = UDim2.new(0, xPos, 0, 0)
-    b.BackgroundColor3 = bg or COL.btnPrimary
-    b.BorderSizePixel = 0
-    b.Font = Enum.Font.Code; b.Text = text
-    b.TextColor3 = Color3.fromRGB(255, 255, 255)
-    b.TextSize = 12; b.TextTruncate = Enum.TextTruncate.AtEnd
-    b.Parent = parent
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
-    return b
-end
-
-local function makeTextRow(placeholder, defaultText)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 26); row.BackgroundTransparency = 1
-    row.Parent = settingsItems
-    local box = Instance.new("TextBox")
-    box.Size = UDim2.new(1, -72, 1, 0)
-    box.BackgroundColor3 = COL.bgInput
-    box.BorderSizePixel = 0
-    box.Font = Enum.Font.Code
-    box.PlaceholderText = placeholder
-    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
-    box.Text = defaultText or ""
-    box.TextColor3 = Color3.fromRGB(255, 255, 255)
-    box.TextSize = 12; box.TextXAlignment = Enum.TextXAlignment.Left
-    box.ClearTextOnFocus = false; box.Parent = row
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 3)
-    Instance.new("UIPadding", box).PaddingLeft = UDim.new(0, 8)
-    local btn = makeSizedBtn(row, "Test", 0, 64, COL.btnMuted)
-    btn.Position = UDim2.new(1, -64, 0, 0)
-    btn.Size = UDim2.new(0, 64, 0, 26)
-    return row, box, btn
-end
-
-intervalSlider = settingsTab.new("slider", {
-    text = "Offline recheck", size = 110,
-    min = CLAMP.interval[1], max = CLAMP.interval[2], value = cfg.interval,
-})
-passSlider = settingsTab.new("slider", {
-    text = "Scan gap", size = 110,
-    min = CLAMP.passDelay[1], max = CLAMP.passDelay[2], value = cfg.passDelay,
-})
-notifySwitch = settingsTab.new("switch", { text = "Notify", on = cfg.notify })
-autoSwitch   = settingsTab.new("switch", { text = "Auto-start", on = cfg.autoStart })
-scoreSwitch  = settingsTab.new("switch", { text = "Show server scores", on = cfg.showScores })
-
-local function widenSliderLabel(slider, w)
-    if slider and slider.self then
-        local txt = slider.self:FindFirstChild("Text")
-        if txt then txt.Size = UDim2.new(0, w or 240, 1, 0) end
+local function detectEvent(prev, result)
+    local prevStatus = prev and prev.status or nil
+    if result.status == "online" then
+        if prevStatus ~= "online" then return "online" end
+        if prev.placeId and result.placeId and prev.placeId ~= result.placeId then
+            return "subplace"
+        end
+        if prev.jobId and prev.jobId ~= "" and result.jobId and result.jobId ~= ""
+            and prev.jobId ~= result.jobId then
+            return "server"
+        end
+    elseif result.status == "offline" and prevStatus == "online" then
+        return "offline"
     end
-end
-widenSliderLabel(intervalSlider, 240)
-widenSliderLabel(passSlider,     240)
-
-sectionLabel("Recheck timing")
-adaptiveSwitch = settingsTab.new("switch", {
-    text = "Poll online players less often", on = cfg.adaptiveRecheck,
-})
-onlineSlider = settingsTab.new("slider", {
-    text = "Online recheck", size = 110,
-    min = CLAMP.onlineRecheck[1], max = CLAMP.onlineRecheck[2], value = cfg.onlineRecheck,
-})
-widenSliderLabel(onlineSlider, 240)
-
-local recheckHint = Instance.new("TextLabel")
-recheckHint.Size = UDim2.new(1, 0, 0, 28)
-recheckHint.BackgroundTransparency = 1
-recheckHint.Font = Enum.Font.Code
-recheckHint.TextSize = 10
-recheckHint.TextColor3 = COL.unknown
-recheckHint.TextWrapped = true
-recheckHint.TextXAlignment = Enum.TextXAlignment.Left
-recheckHint.Text = "Offline players are polled every Offline recheck (to catch them coming online). "
-    .. "Online players are polled every Online recheck (their server rarely changes)."
-recheckHint.Parent = settingsItems
-
-sectionLabel("Audio alert")
-audioSwitch = settingsTab.new("switch", { text = "Play sound on change", on = cfg.audioEnabled })
-local audioRow
-audioRow, audioBox = makeTextRow("Audio asset ID (digits only)", cfg.audioId)
-local audioTestBtn = audioRow:FindFirstChildOfClass("TextButton")
-
-sectionLabel("Discord webhook")
-webhookSwitch = settingsTab.new("switch", { text = "Post on change", on = cfg.webhookEnabled })
-local webhookRow
-webhookRow, webhookBox = makeTextRow("https://discord.com/api/webhooks/…", cfg.webhookUrl)
-local webhookTestBtn = webhookRow:FindFirstChildOfClass("TextButton")
-
-sectionLabel("Config")
-local cfgStatusLabel = Instance.new("TextLabel")
-cfgStatusLabel.Size = UDim2.new(1, 0, 0, 16)
-cfgStatusLabel.BackgroundTransparency = 1
-cfgStatusLabel.Font = Enum.Font.Code; cfgStatusLabel.TextSize = 11
-cfgStatusLabel.TextColor3 = COL.idle
-cfgStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-cfgStatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
-cfgStatusLabel.Text = "Ready"; cfgStatusLabel.Parent = settingsItems
-
-local saveRow = Instance.new("Frame")
-saveRow.Size = UDim2.new(1, 0, 0, 28); saveRow.BackgroundTransparency = 1
-saveRow.Parent = settingsItems
-local saveBtn    = makeSizedBtn(saveRow, "Save",    0,   70)
-local reloadBtn  = makeSizedBtn(saveRow, "Reload",  74,  70)
-local defaultBtn = makeSizedBtn(saveRow, "Defaults",148, 80)
-
-sectionLabel("Files & places")
-local fileRow = Instance.new("Frame")
-fileRow.Size = UDim2.new(1, 0, 0, 28); fileRow.BackgroundTransparency = 1
-fileRow.Parent = settingsItems
-local refreshBtn    = makeSizedBtn(fileRow, "Refresh Players", 0,   130)
-local resetStateBtn = makeSizedBtn(fileRow, "Reset State",   134, 100, COL.btnMuted)
-
-local placesRow = Instance.new("Frame")
-placesRow.Size = UDim2.new(1, 0, 0, 28); placesRow.BackgroundTransparency = 1
-placesRow.Parent = settingsItems
-local rescanBtn = makeSizedBtn(placesRow, "Rescan Places", 0, 130)
-local placesLbl = Instance.new("TextLabel")
-placesLbl.Size = UDim2.new(1, -136, 1, 0)
-placesLbl.Position = UDim2.new(0, 136, 0, 0)
-placesLbl.BackgroundTransparency = 1
-placesLbl.Font = Enum.Font.Code; placesLbl.TextSize = 11
-placesLbl.TextColor3 = COL.unknown
-placesLbl.TextXAlignment = Enum.TextXAlignment.Left
-placesLbl.TextTruncate = Enum.TextTruncate.AtEnd
-placesLbl.Text = ("%d known"):format(placesCount())
-placesLbl.Parent = placesRow
-
-local addPlaceRow = Instance.new("Frame")
-addPlaceRow.Size = UDim2.new(1, 0, 0, 26); addPlaceRow.BackgroundTransparency = 1
-addPlaceRow.Parent = settingsItems
-
-local addPlaceBox = Instance.new("TextBox")
-addPlaceBox.Size = UDim2.new(1, -72, 1, 0)
-addPlaceBox.BackgroundColor3 = COL.bgInput
-addPlaceBox.BorderSizePixel = 0
-addPlaceBox.Font = Enum.Font.Code
-addPlaceBox.PlaceholderText = "placeId or 'placeId: Name'"
-addPlaceBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
-addPlaceBox.Text = ""
-addPlaceBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-addPlaceBox.TextSize = 12; addPlaceBox.TextXAlignment = Enum.TextXAlignment.Left
-addPlaceBox.ClearTextOnFocus = false; addPlaceBox.Parent = addPlaceRow
-Instance.new("UICorner", addPlaceBox).CornerRadius = UDim.new(0, 3)
-Instance.new("UIPadding", addPlaceBox).PaddingLeft = UDim.new(0, 8)
-
-local addPlaceBtn = makeSizedBtn(addPlaceRow, "Add", 0, 64)
-addPlaceBtn.Position = UDim2.new(1, -64, 0, 0)
-addPlaceBtn.Size = UDim2.new(0, 64, 0, 26)
-
-local pathsLabel = Instance.new("TextLabel")
-pathsLabel.Size = UDim2.new(1, 0, 0, 16)
-pathsLabel.BackgroundTransparency = 1
-pathsLabel.Font = Enum.Font.Code; pathsLabel.TextSize = 10
-pathsLabel.TextColor3 = COL.unknown
-pathsLabel.TextXAlignment = Enum.TextXAlignment.Left
-pathsLabel.TextTruncate = Enum.TextTruncate.AtEnd
-pathsLabel.Text = "Files: UniversalScanner/ (config, names, state, places, log)"
-pathsLabel.Parent = settingsItems
-
-local killRow = Instance.new("Frame")
-killRow.Size = UDim2.new(1, 0, 0, 34); killRow.BackgroundTransparency = 1
-killRow.Parent = settingsItems
-local killFullBtn = makeSizedBtn(killRow, "KILL SCRIPT", 0, 220, COL.btnKill)
-
--- ============================================================
--- Getters
--- ============================================================
-function getInterval()
-    local v = intervalSlider and intervalSlider.value
-    if type(v) ~= "number" then return cfg.interval end
-    return math.clamp(math.floor(v + 0.5), CLAMP.interval[1], CLAMP.interval[2])
-end
-function getPassDelay()
-    local v = passSlider and passSlider.value
-    if type(v) ~= "number" then return cfg.passDelay end
-    return math.clamp(math.floor(v + 0.5), CLAMP.passDelay[1], CLAMP.passDelay[2])
-end
-function getOnlineRecheck()
-    local v = onlineSlider and onlineSlider.value
-    if type(v) ~= "number" then return cfg.onlineRecheck end
-    return math.clamp(math.floor(v + 0.5), CLAMP.onlineRecheck[1], CLAMP.onlineRecheck[2])
+    return nil
 end
 
--- ============================================================
--- Notifications
--- ============================================================
-local function notifyChange(name, result, prevStatus)
+local function notifyChange(name, result, prev)
     if killed then return end
+    local event = detectEvent(prev, result)
+    if not event then return end
+
     local scoreStr = ""
     if result.status == "online" and result.jobId then
         local s = serverCache[result.jobId]
-        if s and (os.time() - s.at) <= CLAMP.scoreTTL then
+        if s and (os.time() - s.at) <= getNum("scoreTTL") then
             scoreStr = ("Q%d %d:%02d · %d-%d")
                 :format(s.quarter, s.minutes, s.seconds, s.home, s.away)
-        elseif result.playerCount and result.maxPlayers and tonumber(result.maxPlayers) > 0 then
+        elseif result.playerCount and result.maxPlayers and tonumber(result.maxPlayers)
+            and tonumber(result.maxPlayers) > 0 then
             scoreStr = ("%d/%d"):format(tonumber(result.playerCount), tonumber(result.maxPlayers))
         end
     end
-    if notifySwitch and notifySwitch.on then
-        if result.status == "online" and prevStatus ~= "online" then
+
+    if flag(notifySwitch, "notify") then
+        local who = result.exactMatch == false
+            and ("'" .. name .. "' → '" .. (result.displayName or "?") .. "'")
+            or name
+        if event == "online" then
             local where = result.placeName and (" in " .. result.placeName) or ""
-            local who = result.exactMatch == false
-                and ("'" .. name .. "' → '" .. (result.displayName or "?") .. "'")
-                or name
             logLine("ONLINE " .. who .. where)
             toast("Player Online", who .. where)
-        elseif result.status == "offline" and prevStatus == "online" then
+        elseif event == "offline" then
             logLine("OFFLINE " .. name)
             toast("Player Offline", name .. " went offline")
+        elseif event == "subplace" then
+            local msg = ("%s: %s → %s"):format(who, placeLabel(prev), placeLabel(result))
+            logLine("SUBPLACE " .. msg)
+            toast("Changed Subplace", msg)
+        elseif event == "server" then
+            local msg = ("%s switched servers in %s"):format(who, placeLabel(result))
+            logLine("SERVER " .. msg)
+            toast("Changed Server", msg)
         end
     end
-    if result.status == "online" and prevStatus ~= "online" then playAlert() end
-    webhookStatus(name, result, prevStatus, scoreStr)
+
+    if event ~= "offline" then playAlert() end
+    webhookEvent(name, result, prev, event, scoreStr)
 end
 
 -- ============================================================
@@ -1464,7 +1464,6 @@ refreshOne = function(name, btn)
     refreshing[name] = true
     if btn and btn.Parent then btn.Text = "…" end
     local prev = state.results[name]
-    local prevStatus = prev and prev.status or nil
     task.spawn(function()
         local result = scanWithTimeout(name)
         refreshing[name] = nil
@@ -1476,85 +1475,101 @@ refreshOne = function(name, btn)
         end
         state.results[name] = result
         saveState(state)
-        notifyChange(name, result, prevStatus)
+        notifyChange(name, result, prev)
         updatePlayerLabel(name, result)
         updateStatusLine()
     end)
 end
 
 -- ============================================================
--- Scan loop — sequential, skip-fresh
+-- Scan loop — tick-based queue
+--   Every tick: collect expired players, scan them one by one.
 -- ============================================================
 local function stopScan()
     running = false; scanGen = scanGen + 1
     updateStatusLine("Stopped")
 end
 
-local function interruptibleSleep(seconds, myGen, tailLabel, mode)
-    mode = mode or "Sleeping"
-    local remaining = math.floor(seconds + 0.5)
-    while remaining > 0 and running and scanGen == myGen and not killed do
-        updateStatusLine(mode, ("%s in %ds"):format(tailLabel, remaining))
-        local step = math.min(1, remaining)
-        task.wait(step); remaining = remaining - step
-    end
-    if running and scanGen == myGen then currentMode = "Running" end
-end
-
--- Minimum gap between consecutive scans. Prevents bursts without
--- turning the loop into a slow drip.
-local lastScanAt = 0
-local function applyScanGap(myGen)
-    local gap = getPassDelay()
-    if gap <= 0 then return true end
-    local since = tick() - lastScanAt
-    local remaining = gap - since
-    if remaining <= 0 then return true end
-    interruptibleSleep(remaining, myGen, "next scan", "Running")
+local function alive(myGen)
     return running and scanGen == myGen and not killed
 end
 
+local function interruptibleSleep(seconds, myGen, tailLabel, mode)
+    mode = mode or "Sleeping"
+    local endAt = tick() + seconds
+    while alive(myGen) do
+        local left = endAt - tick()
+        if left <= 0 then break end
+        updateStatusLine(mode, ("%s in %ds"):format(tailLabel, math.ceil(left)))
+        task.wait(math.min(0.5, left))
+    end
+    if alive(myGen) then currentMode = "Running" end
+end
+
+-- Minimum gap between consecutive scans.
+local lastScanAt = 0
+local function applyScanGap(myGen)
+    local gap = getNum("passDelay")
+    if gap <= 0 then return true end
+    local remaining = gap - (tick() - lastScanAt)
+    if remaining <= 0 then return true end
+    interruptibleSleep(remaining, myGen, "next scan", "Running")
+    return alive(myGen)
+end
+
+-- Pick the players that are most overdue for a lookup (never-checked first),
+-- up to `limit`. Ties follow list order. Also returns how many are waiting.
+local function nextBatch(limit)
+    local now = os.time()
+    local cands = {}
+    for i, name in ipairs(names) do
+        local r = state.results[name]
+        local overdue
+        if not r or not r.at then overdue = math.huge
+        else overdue = (now - r.at) - expiryFor(r) end
+        if overdue >= 0 then cands[#cands + 1] = { name = name, overdue = overdue, idx = i } end
+    end
+    table.sort(cands, function(a, b)
+        if a.overdue ~= b.overdue then return a.overdue > b.overdue end
+        return a.idx < b.idx
+    end)
+    local out = {}
+    for i = 1, math.min(limit, #cands) do out[i] = cands[i].name end
+    return out, #cands
+end
+
 local function scanLoop(myGen)
-    while running and scanGen == myGen and not killed do
+    while alive(myGen) do
         if #names == 0 then return end
+        local tickStart = tick()
 
-        -- Snapshot the list so a Remove mid-walk doesn't shift indices under us.
-        local passNames = {}
-        for i = 1, #names do passNames[i] = names[i] end
+        -- Take the next few players off the queue (most overdue first).
+        local queue, waiting = nextBatch(getNum("batchSize"))
 
-        local scanned = 0
-        for _, name in ipairs(passNames) do
-            if not (running and scanGen == myGen and not killed) then break end
-
-            -- Skip names removed while we were walking the snapshot.
-            local live = false
-            for _, n in ipairs(names) do
-                if n == name then live = true; break end
-            end
-            if not live then continue end
-
-            -- Skip fresh data. Only scan what's actually stale.
-            if isStale(name) then
+        for qi, name in ipairs(queue) do
+            if not alive(myGen) then break end
+            -- skip if removed meanwhile, or refreshed manually meanwhile
+            if rowIndexOf(name) and isStale(name) then
                 if not applyScanGap(myGen) then break end
-                updateStatusLine("Running", "scanning " .. name)
+                updateStatusLine("Running", ("looking up %s (%d waiting)"):format(name, math.max(0, waiting - qi + 1)))
 
                 local prev = state.results[name]
-                local prevStatus = prev and prev.status or nil
-                local base = getInterval()
+                local base = getNum("interval")
+                local maxRetries = getNum("retries")
 
                 local result, attempt = nil, 0
                 while true do
                     result = scanWithTimeout(name)
                     if result.status ~= "error" then break end
                     attempt = attempt + 1
-                    if attempt > CLAMP.retries then break end
-                    local waitS = math.min(base * (2 ^ attempt), CLAMP.maxBackoff)
+                    if attempt > maxRetries then break end
+                    local waitS = math.min(base * (2 ^ attempt), getNum("maxBackoff"))
                     logLine(("Retry %d/%d for %s in %.0fs — %s")
-                        :format(attempt, CLAMP.retries, name, waitS, result.reason or "?"))
+                        :format(attempt, maxRetries, name, waitS, result.reason or "?"))
                     interruptibleSleep(waitS, myGen, "retrying " .. name)
-                    if not (running and scanGen == myGen and not killed) then break end
+                    if not alive(myGen) then break end
                 end
-                if not (running and scanGen == myGen and not killed) then break end
+                if not alive(myGen) then break end
 
                 if result.status == "error" then
                     state.results[name] = {
@@ -1563,34 +1578,31 @@ local function scanLoop(myGen)
                     logLine("UNKNOWN " .. name .. " — " .. (result.reason or "?"))
                 else
                     state.results[name] = result
-                    notifyChange(name, result, prevStatus)
+                    if result.userId and result.userId > 0 then
+                        state.userIds[name:lower()] = result.userId
+                    end
+                    notifyChange(name, result, prev)
                 end
                 updatePlayerLabel(name, state.results[name])
                 saveState(state)
-                scanned = scanned + 1
                 lastScanAt = tick()
 
                 local now = os.time()
-                if cfg.showScores and (now - lastServerFetch) >= CLAMP.scoreRefresh then
+                if flag(scoreSwitch, "showScores") and (now - lastServerFetch) >= getNum("scoreRefresh") then
                     lastServerFetch = now
                     task.spawn(fetchServerPage)
                 end
             end
         end
 
-        if scanned == 0 then
-            -- Nothing stale in this walk. Sleep until the soonest goes stale.
-            local wait = timeUntilNextStale()
-            if wait <= 0 then wait = 0.1 end
-            wait = math.min(wait, 30)
-            local endAt = tick() + wait
-            while tick() < endAt and running and scanGen == myGen and not killed do
-                local remaining = math.ceil(endAt - tick())
-                updateStatusLine("Running", ("all fresh — next in %ds"):format(remaining))
-                task.wait(0.5)
-            end
+        if not alive(myGen) then break end
+
+        -- Wait out the rest of the tick before checking for expired players again.
+        local remain = getNum("interval") - (tick() - tickStart)
+        if remain > 0 then
+            interruptibleSleep(remain, myGen, "next check", "Running")
         else
-            updateStatusLine("Running")
+            task.wait(0.1)
         end
     end
 end
@@ -1619,7 +1631,7 @@ end
 
 local function resetScanState()
     running = false; scanGen = scanGen + 1
-    state = { version = 3, results = {} }
+    state = { version = 3, results = {}, userIds = state.userIds or {} }
     saveState(state)
     for name in pairs(playerRows) do
         local r = playerRows[name]
@@ -1646,12 +1658,9 @@ local function killEverything()
         local imgui = CoreGui:FindFirstChild("imgui2")
         if not imgui then return end
 
-        -- Destroy only OUR window (matched by title) — other scripts using
-        -- rbimgui-2 in the same session keep their UIs intact.
         local mine = findMainFrame(WIN_TITLE)
         if mine then mine:Destroy() end
 
-        -- Tear down the shared container only if no other script's Main remains.
         local stillUsed = false
         for _, child in ipairs(imgui:GetChildren()) do
             if child.Name == "Main" then stillUsed = true; break end
@@ -1667,151 +1676,349 @@ local function killEverything()
             { Title = "Scanner", Text = "Script killed — re-run to relaunch", Duration = 4 })
     end)
 end
-killFullBtn.MouseButton1Click:Connect(killEverything)
 
 -- ============================================================
--- Settings actions
+-- SETTINGS TAB
+-- Built and wired entirely inside do-blocks so the widget locals
+-- are released afterwards (executors/Luau cap a function at 200 locals).
 -- ============================================================
-local function currentUIAsConfig()
-    return {
-        interval  = getInterval(),
-        passDelay = getPassDelay(),
-        onlineRecheck = getOnlineRecheck(),
-        adaptiveRecheck = adaptiveSwitch.on,
-        notify    = notifySwitch.on,
-        autoStart = autoSwitch.on,
-        showScores = scoreSwitch.on,
-        audioEnabled = audioSwitch.on,
-        audioId = audioBox.Text,
-        webhookEnabled = webhookSwitch.on,
-        webhookUrl = webhookBox.Text,
-        windowW   = mainFrame and math.floor(mainFrame.AbsoluteSize.X) or cfg.windowW,
-        windowH   = contentFrame and math.floor(contentFrame.AbsoluteSize.Y) or cfg.windowH,
-    }
+do
+local settingsTab = window.new({ text = "Settings" })
+local settingsItems
+do
+    local stmp = settingsTab.new("label", { text = "" })
+    settingsItems = stmp.self.Parent
+    stmp.self:Destroy()
 end
 
-saveBtn.MouseButton1Click:Connect(function()
-    if killed then return end
-    cfg = sanitizeConfig(currentUIAsConfig()); saveConfig(cfg)
-    audioBox.Text = cfg.audioId
-    webhookBox.Text = cfg.webhookUrl
-    cfgStatusLabel.Text = "Saved  " .. timestamp()
-    cfgStatusLabel.TextColor3 = COL.ok
-    logLine("Config saved")
-end)
+local function sectionLabel(text, color)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, 0, 0, 16)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.Code; l.TextSize = 11
+    l.TextColor3 = color or COL.idle
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Text = text; l.Parent = settingsItems
+    return l
+end
 
-reloadBtn.MouseButton1Click:Connect(function()
-    if killed then return end
-    cfg = loadConfig()
-    intervalSlider.set(cfg.interval); passSlider.set(cfg.passDelay)
-    onlineSlider.set(cfg.onlineRecheck); adaptiveSwitch.set(cfg.adaptiveRecheck)
-    notifySwitch.set(cfg.notify); autoSwitch.set(cfg.autoStart)
-    scoreSwitch.set(cfg.showScores)
-    audioSwitch.set(cfg.audioEnabled); audioBox.Text = cfg.audioId
-    webhookSwitch.set(cfg.webhookEnabled); webhookBox.Text = cfg.webhookUrl
-    cfgStatusLabel.Text = "Reloaded"
-    cfgStatusLabel.TextColor3 = COL.ok
-end)
+local function hintLabel(text, h)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, 0, 0, h or 28)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.Code; l.TextSize = 10
+    l.TextColor3 = COL.unknown
+    l.TextWrapped = true
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Top
+    l.Text = text; l.Parent = settingsItems
+    return l
+end
 
-defaultBtn.MouseButton1Click:Connect(function()
-    if killed then return end
-    intervalSlider.set(HARD_DEFAULTS.interval)
-    passSlider.set(HARD_DEFAULTS.passDelay)
-    onlineSlider.set(HARD_DEFAULTS.onlineRecheck)
-    adaptiveSwitch.set(HARD_DEFAULTS.adaptiveRecheck)
-    notifySwitch.set(HARD_DEFAULTS.notify)
-    autoSwitch.set(HARD_DEFAULTS.autoStart)
-    scoreSwitch.set(HARD_DEFAULTS.showScores)
-    audioSwitch.set(false); audioBox.Text = ""
-    webhookSwitch.set(false); webhookBox.Text = ""
-    cfgStatusLabel.Text = "Defaults applied (not saved)"
-    cfgStatusLabel.TextColor3 = COL.warn
-end)
+local function makeSizedBtn(parent, text, xPos, width, bg)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, width, 0, 26)
+    b.Position = UDim2.new(0, xPos, 0, 0)
+    b.BackgroundColor3 = bg or COL.btnPrimary
+    b.BorderSizePixel = 0
+    b.Font = Enum.Font.Code; b.Text = text
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.TextSize = 12; b.TextTruncate = Enum.TextTruncate.AtEnd
+    b.Parent = parent
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+    return b
+end
 
-refreshBtn.MouseButton1Click:Connect(function()
-    if killed then return end
-    running = false; scanGen = scanGen + 1
-    names = loadNames(); state = loadState(); pruneState(state, names)
-    rebuildRows(); updateStatusLine("Stopped")
-    cfgStatusLabel.Text = ("Refreshed: %d player(s)"):format(#names)
-    cfgStatusLabel.TextColor3 = COL.ok
-    logLine(("Refresh: %d players"):format(#names))
-end)
+local function makeRow(h)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, h); row.BackgroundTransparency = 1
+    row.Parent = settingsItems
+    return row
+end
 
-resetStateBtn.MouseButton1Click:Connect(function()
-    if killed then return end
-    resetScanState()
-    cfgStatusLabel.Text = "State cleared"
-    cfgStatusLabel.TextColor3 = COL.ok
-end)
+local function makeInput(parent, placeholder, text, size)
+    local box = Instance.new("TextBox")
+    box.Size = size
+    box.BackgroundColor3 = COL.bgInput
+    box.BorderSizePixel = 0
+    box.Font = Enum.Font.Code
+    box.PlaceholderText = placeholder
+    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
+    box.Text = text or ""
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.TextSize = 12; box.TextXAlignment = Enum.TextXAlignment.Left
+    box.ClearTextOnFocus = false; box.Parent = parent
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 3)
+    Instance.new("UIPadding", box).PaddingLeft = UDim.new(0, 8)
+    return box
+end
 
-rescanBtn.MouseButton1Click:Connect(function()
-    if killed then return end
-    cfgStatusLabel.Text = "Rescanning places…"
-    cfgStatusLabel.TextColor3 = COL.warn
-    refreshPlaces(function(ok, data)
-        if killed then return end
-        if ok then
-            placesLbl.Text = ("%d known"):format(placesCount())
-            cfgStatusLabel.Text = ("Places: %d"):format(placesCount())
-            cfgStatusLabel.TextColor3 = COL.ok
-        else
-            cfgStatusLabel.Text = "Rescan failed: " .. tostring(data):sub(1, 80)
-            cfgStatusLabel.TextColor3 = COL.error
-        end
+-- Text row with optional trailing button -> returns box, button
+local function makeTextRow(placeholder, defaultText, btnText)
+    local row = makeRow(26)
+    local box = makeInput(row, placeholder, defaultText,
+        UDim2.new(1, btnText and -72 or 0, 1, 0))
+    local btn
+    if btnText then
+        btn = makeSizedBtn(row, btnText, 0, 64, COL.btnMuted)
+        btn.Position = UDim2.new(1, -64, 0, 0)
+    end
+    return box, btn
+end
+
+local function makeNumInput(key)
+    local f = NUM_BY_KEY[key]
+    local row = makeRow(26)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -86, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.Code; lbl.TextSize = 12
+    lbl.TextColor3 = COL.row
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextTruncate = Enum.TextTruncate.AtEnd
+    lbl.Text = ("%s  [%d–%d]"):format(f.label, f.min, f.max)
+    lbl.Parent = row
+    local box = makeInput(row, tostring(f.def), tostring(cfg[key]), UDim2.new(0, 80, 1, 0))
+    box.Position = UDim2.new(1, -80, 0, 0)
+    box.TextXAlignment = Enum.TextXAlignment.Center
+    -- tidy whatever was typed into a valid, in-range whole number
+    box.FocusLost:Connect(function()
+        box.Text = tostring(getNum(key))
     end)
-end)
+    numBoxes[key] = box
+end
 
-addPlaceBtn.MouseButton1Click:Connect(function()
-    if killed then return end
-    local raw = addPlaceBox.Text
-    local idStr, name = raw:match("^(%d+)%s*:?%s*(.-)$")
-    local id = tonumber(idStr)
-    if not id then
-        cfgStatusLabel.Text = "Place: invalid ID"
-        cfgStatusLabel.TextColor3 = COL.warn
-        return
+local W = {}             -- widgets wired later
+local cfgStatusLabel     -- created in the Config section
+local function setStatus(text, color)
+    cfgStatusLabel.Text = text
+    cfgStatusLabel.TextColor3 = color
+end
+
+-- General toggles
+sectionLabel("General")
+notifySwitch = settingsTab.new("switch", { text = "Show in-game notifications", on = cfg.notify })
+autoSwitch   = settingsTab.new("switch", { text = "Start automatically", on = cfg.autoStart })
+scoreSwitch  = settingsTab.new("switch", { text = "Show game scores", on = cfg.showScores })
+avatarSwitch = settingsTab.new("switch", { text = "Show player avatars", on = cfg.showAvatars })
+
+sectionLabel("Appearance")
+makeNumInput("uiScale")
+
+sectionLabel("Checking")
+makeNumInput("interval")
+makeNumInput("batchSize")
+makeNumInput("passDelay")
+hintLabel("At each check, the players whose results are most out of date are looked up, one at a time, "
+    .. "up to the limit above (default 1, to avoid overloading the game). If several are equally "
+    .. "overdue, the higher one in your list goes first.", 52)
+
+sectionLabel("How long each result stays current")
+makeNumInput("expireOnline")
+makeNumInput("expireOffline")
+makeNumInput("expireNotFound")
+makeNumInput("expireUnknown")
+hintLabel("Once a result is older than its time here, the player is looked up again at the next check.", 28)
+
+sectionLabel("Connection")
+makeNumInput("timeout")
+makeNumInput("retries")
+makeNumInput("maxBackoff")
+
+sectionLabel("Game scores")
+makeNumInput("scoreRefresh")
+makeNumInput("scoreTTL")
+
+sectionLabel("Sound alert (player comes online or moves)")
+audioSwitch = settingsTab.new("switch", { text = "Play a sound on changes", on = cfg.audioEnabled })
+audioBox, W.audioTest = makeTextRow("Roblox audio ID (numbers only)", cfg.audioId, "Test")
+
+sectionLabel("Discord webhook")
+webhookSwitch = settingsTab.new("switch", { text = "Send a Discord message on changes", on = cfg.webhookEnabled })
+webhookBox, W.webhookTest = makeTextRow("https://discord.com/api/webhooks/…", cfg.webhookUrl, "Test")
+
+-- Config save / reload / defaults
+sectionLabel("Save settings")
+cfgStatusLabel = Instance.new("TextLabel")
+cfgStatusLabel.Size = UDim2.new(1, 0, 0, 16)
+cfgStatusLabel.BackgroundTransparency = 1
+cfgStatusLabel.Font = Enum.Font.Code; cfgStatusLabel.TextSize = 11
+cfgStatusLabel.TextColor3 = COL.idle
+cfgStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+cfgStatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+cfgStatusLabel.Text = "Ready"; cfgStatusLabel.Parent = settingsItems
+
+do
+    local saveRow = makeRow(28)
+    local saveBtn    = makeSizedBtn(saveRow, "Save",    0,   70)
+    local reloadBtn  = makeSizedBtn(saveRow, "Load saved",  74,  90)
+    local defaultBtn = makeSizedBtn(saveRow, "Defaults",168, 80)
+
+    local function currentUIAsConfig()
+        local c = {
+            notify    = notifySwitch.on,
+            autoStart = autoSwitch.on,
+            showScores = scoreSwitch.on,
+            showAvatars = avatarSwitch.on,
+            audioEnabled = audioSwitch.on,
+            audioId = audioBox.Text,
+            webhookEnabled = webhookSwitch.on,
+            webhookUrl = webhookBox.Text,
+            windowW   = mainFrame and math.floor(mainFrame.AbsoluteSize.X / getScale()) or cfg.windowW,
+            windowH   = contentFrame and math.floor(contentFrame.AbsoluteSize.Y / getScale()) or cfg.windowH,
+        }
+        for _, f in ipairs(NUMS) do c[f.key] = getNum(f.key) end
+        return c
     end
-    if BLOCKED_PLACES[id] then
-        cfgStatusLabel.Text = "Blocked: " .. BLOCKED_PLACES[id]
-        cfgStatusLabel.TextColor3 = COL.error
-        return
+
+    local function applyConfigToUI(c)
+        for _, f in ipairs(NUMS) do
+            if numBoxes[f.key] then numBoxes[f.key].Text = tostring(c[f.key]) end
+        end
+        notifySwitch.set(c.notify); autoSwitch.set(c.autoStart)
+        scoreSwitch.set(c.showScores); avatarSwitch.set(c.showAvatars)
+        audioSwitch.set(c.audioEnabled); audioBox.Text = c.audioId
+        webhookSwitch.set(c.webhookEnabled); webhookBox.Text = c.webhookUrl
     end
-    if name == nil or name == "" then name = "Place " .. id end
-    places[id] = name
-    savePlaces()
+
+    saveBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        cfg = sanitizeConfig(currentUIAsConfig()); saveConfig(cfg)
+        audioBox.Text = cfg.audioId
+        webhookBox.Text = cfg.webhookUrl
+        for _, f in ipairs(NUMS) do numBoxes[f.key].Text = tostring(cfg[f.key]) end
+        setStatus("Saved  " .. timestamp(), COL.ok)
+        logLine("Config saved")
+    end)
+
+    reloadBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        cfg = loadConfig()
+        applyConfigToUI(cfg)
+        setStatus("Reloaded", COL.ok)
+    end)
+
+    defaultBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        local d = sanitizeConfig(HARD_DEFAULTS)
+        d.audioEnabled = false; d.audioId = ""
+        d.webhookEnabled = false; d.webhookUrl = ""
+        applyConfigToUI(d)
+        setStatus("Defaults applied (not saved)", COL.warn)
+    end)
+end
+
+-- Files & places
+sectionLabel("Data & game places")
+do
+    local fileRow = makeRow(28)
+    local refreshBtn    = makeSizedBtn(fileRow, "Reload name list", 0,   130)
+    local resetStateBtn = makeSizedBtn(fileRow, "Clear results",   134, 100, COL.btnMuted)
+
+    local placesRow = makeRow(28)
+    local rescanBtn = makeSizedBtn(placesRow, "Update place list", 0, 130)
+    local placesLbl = Instance.new("TextLabel")
+    placesLbl.Size = UDim2.new(1, -136, 1, 0)
+    placesLbl.Position = UDim2.new(0, 136, 0, 0)
+    placesLbl.BackgroundTransparency = 1
+    placesLbl.Font = Enum.Font.Code; placesLbl.TextSize = 11
+    placesLbl.TextColor3 = COL.unknown
+    placesLbl.TextXAlignment = Enum.TextXAlignment.Left
+    placesLbl.TextTruncate = Enum.TextTruncate.AtEnd
     placesLbl.Text = ("%d known"):format(placesCount())
-    cfgStatusLabel.Text = ("Added place %d"):format(id)
-    cfgStatusLabel.TextColor3 = COL.ok
-    addPlaceBox.Text = ""
-    logLine(("Manual place add: %d = %s"):format(id, name))
-end)
+    placesLbl.Parent = placesRow
 
-audioTestBtn.MouseButton1Click:Connect(function()
+    local addPlaceRow = makeRow(26)
+    local addPlaceBox = makeInput(addPlaceRow, "Place ID, or 'ID: Name'", "",
+        UDim2.new(1, -144, 1, 0))
+    local addPlaceBtn = makeSizedBtn(addPlaceRow, "Add", 0, 64)
+    addPlaceBtn.Position = UDim2.new(1, -140, 0, 0)
+    local removePlaceBtn = makeSizedBtn(addPlaceRow, "Remove", 0, 70, COL.btnStop)
+    removePlaceBtn.Position = UDim2.new(1, -70, 0, 0)
+
+    hintLabel("Files: UniversalScanner/ (config, names, state, places, log)", 16)
+
+    local killRow = makeRow(34)
+    local killFullBtn = makeSizedBtn(killRow, "CLOSE SCRIPT", 0, 220, COL.btnKill)
+
+    -- ---- wiring ----
+    killFullBtn.MouseButton1Click:Connect(killEverything)
+
+    refreshBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        running = false; scanGen = scanGen + 1
+        names = loadNames(); state = loadState(); pruneState(state, names)
+        rebuildRows(); updateStatusLine("Stopped")
+        setStatus(("Refreshed: %d player(s)"):format(#names), COL.ok)
+        logLine(("Refresh: %d players"):format(#names))
+    end)
+
+    resetStateBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        resetScanState()
+        setStatus("State cleared", COL.ok)
+    end)
+
+    rescanBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        setStatus("Rescanning places…", COL.warn)
+        refreshPlaces(function(ok, data)
+            if killed then return end
+            if ok then
+                placesLbl.Text = ("%d known"):format(placesCount())
+                setStatus(("Places: %d"):format(placesCount()), COL.ok)
+            else
+                setStatus("Rescan failed: " .. tostring(data):sub(1, 80), COL.error)
+            end
+        end)
+    end)
+
+    addPlaceBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        local idStr, name = addPlaceBox.Text:match("^(%d+)%s*:?%s*(.-)$")
+        local id = tonumber(idStr)
+        if not id then setStatus("Place: invalid ID", COL.warn); return end
+        if BLOCKED_PLACES[id] then
+            setStatus("Blocked: " .. BLOCKED_PLACES[id], COL.error); return
+        end
+        if name == nil or name == "" then name = "Place " .. id end
+        places[id] = name
+        savePlaces()
+        placesLbl.Text = ("%d known"):format(placesCount())
+        setStatus(("Added place %d"):format(id), COL.ok)
+        addPlaceBox.Text = ""
+        logLine(("Manual place add: %d = %s"):format(id, name))
+    end)
+
+    removePlaceBtn.MouseButton1Click:Connect(function()
+        if killed then return end
+        local id = tonumber(addPlaceBox.Text:match("^%s*(%d+)"))
+        if not id then setStatus("Place: enter an ID to remove", COL.warn); return end
+        if not places[id] then
+            setStatus(("Place %d not in list"):format(id), COL.warn); return
+        end
+        places[id] = nil
+        savePlaces()
+        placesLbl.Text = ("%d known"):format(placesCount())
+        setStatus(("Removed place %d"):format(id), COL.ok)
+        addPlaceBox.Text = ""
+        logLine(("Manual place remove: %d"):format(id))
+    end)
+end
+
+W.audioTest.MouseButton1Click:Connect(function()
     if killed then return end
     local id = tonumber(cleanAudioId(audioBox.Text))
-    if not id or id <= 0 then
-        cfgStatusLabel.Text = "Audio: invalid ID"
-        cfgStatusLabel.TextColor3 = COL.warn
-        return
-    end
-    local s = Instance.new("Sound")
-    s.SoundId = "rbxassetid://" .. id
-    s.Volume = 0.6
-    s.Parent = SoundService
-    pcall(function() SoundService:PlayLocalSound(s) end)
-    pcall(function() s:Play() end)
-    task.delay(6, function() pcall(function() s:Destroy() end) end)
-    cfgStatusLabel.Text = "Audio test: " .. id
-    cfgStatusLabel.TextColor3 = COL.ok
+    if not id or id <= 0 then setStatus("Audio: invalid ID", COL.warn); return end
+    playSound(id)
+    setStatus("Audio test: " .. id, COL.ok)
 end)
 
-webhookTestBtn.MouseButton1Click:Connect(function()
+W.webhookTest.MouseButton1Click:Connect(function()
     if killed then return end
     local url = webhookBox.Text
     if not url:match("^https://discord") then
-        cfgStatusLabel.Text = "Webhook: URL must start with https://discord"
-        cfgStatusLabel.TextColor3 = COL.warn
+        setStatus("Webhook: URL must start with https://discord", COL.warn)
         return
     end
     local body = HttpService:JSONEncode({
@@ -1830,15 +2037,25 @@ webhookTestBtn.MouseButton1Click:Connect(function()
             Body = body,
         })
         if killed then return end
-        if res then
-            cfgStatusLabel.Text = "Webhook test sent"
-            cfgStatusLabel.TextColor3 = COL.ok
-        else
-            cfgStatusLabel.Text = "Webhook test failed"
-            cfgStatusLabel.TextColor3 = COL.error
-        end
+        if res then setStatus("Webhook test sent", COL.ok)
+        else setStatus("Webhook test failed", COL.error) end
     end)
 end)
+end -- settings do-block
+
+-- ============================================================
+-- Menu zoom (UIScale on the window, follows the "Menu size" setting live)
+-- ============================================================
+if mainFrame then
+    local u = Instance.new("UIScale")
+    u.Scale = getNum("uiScale") / 100
+    u.Parent = mainFrame
+    RunService.Heartbeat:Connect(function()
+        if killed or not u.Parent then return end
+        local want = getNum("uiScale") / 100
+        if u.Scale ~= want then u.Scale = want end
+    end)
+end
 
 -- ============================================================
 -- Resize grip
@@ -1866,8 +2083,8 @@ if mainFrame and contentFrame then
         if killed then return end
         dragging = true
         startMouse = UserInputService:GetMouseLocation()
-        startW = mainFrame.AbsoluteSize.X
-        startH = contentFrame.AbsoluteSize.Y
+        startW = mainFrame.AbsoluteSize.X / getScale()
+        startH = contentFrame.AbsoluteSize.Y / getScale()
     end)
     UserInputService.InputChanged:Connect(function(input)
         if not dragging or killed then return end
@@ -1876,7 +2093,8 @@ if mainFrame and contentFrame then
         end
         if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
         local cur = UserInputService:GetMouseLocation()
-        local dx, dy = cur.X - startMouse.X, cur.Y - startMouse.Y
+        local sc = getScale()
+        local dx, dy = (cur.X - startMouse.X) / sc, (cur.Y - startMouse.Y) / sc
         local newW = math.clamp(startW + dx, CLAMP.windowW[1], CLAMP.windowW[2])
         local newH = math.clamp(startH + dy, CLAMP.windowH[1], CLAMP.windowH[2])
         mainFrame.Size    = UDim2.new(0, newW, 0, mainHeight)
